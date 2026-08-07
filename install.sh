@@ -8,6 +8,7 @@ TMP_KYRO=$(mktemp)
 TMP_UNINSTALL=$(mktemp)
 
 curl -fsSL "https://raw.githubusercontent.com/mykosoftware/Kyro/main/Kyro.sh" -o "$TMP_KYRO"
+
 curl -fsSL "https://raw.githubusercontent.com/mykosoftware/Kyro/main/uninstall.sh" -o "$TMP_UNINSTALL"
 
 sudo install -Dm755 "$TMP_KYRO" /usr/local/bin/kyro
