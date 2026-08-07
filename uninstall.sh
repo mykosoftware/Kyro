@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 
-echo "Desinstalando Kyro..."
+set -e
 
-sudo rm -f /usr/local/bin/kyro
-echo "Kyro fue desinstalado."
+echo "Desinstalando Kyro Optimizer..."
+
+if [ -f /usr/local/bin/kyro ]; then
+    sudo rm -f /usr/local/bin/kyro
+    echo "Kyro eliminado correctamente."
+else
+    echo "Kyro no está instalado."
+fi
+
+echo ""
+echo "Desinstalación completada."
