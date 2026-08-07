@@ -6,9 +6,7 @@ echo "Instalando Kyro Optimizer..."
 
 TMP_FILE=$(mktemp)
 
-curl -fsSL \
-"https://raw.githubusercontent.com/mykosoftware/Kyro/main/Kyro.sh" \
--o "$TMP_FILE"
+curl -fsSL "https://raw.githubusercontent.com/mykosoftware/Kyro/main/Kyro.sh" -o "$TMP_FILE"
 
 sudo install -Dm755 "$TMP_FILE" /usr/local/bin/kyro
 
