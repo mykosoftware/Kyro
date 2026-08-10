@@ -3,11 +3,11 @@
 # ═══════════════════════════════════════════════════════
 #  Kyro Optimizer – Mantenimiento y diagnóstico del sistema
 #  Licencia: GPL-3.0
-#  Versión: 3.21
+#  Versión: 3.3
 # ═══════════════════════════════════════════════════════
 
 set -uo pipefail
-VERSION="3.21"
+VERSION="3.3"
 
 # ─── Colores ───────────────────────────────────────────
 CYAN="\e[36m"
@@ -21,6 +21,10 @@ DIM="\e[2m"
 RESET="\e[0m"
 
 STATE_FILE="$HOME/.cache/kyro_last_run"
+
+# Acumulan ajustes aplicados en esta sesión para persistirlos.
+KYRO_SYSCTL=()
+KYRO_NET=()
 
 # ─── Rutas del script y actualizaciones ────────────────
 SCRIPT_PATH="${BASH_SOURCE[0]}"
@@ -375,19 +379,32 @@ cache() {
         [[ -d "$_d" ]] && { spinner "AppImage: $(basename "$_d")" rm -rf "$_d"; }
     done
 
-    # ── Miniaturas y fontconfig ──
+    # ── Miniaturas, fontconfig y cachés de bajo riesgo ──
     local sys_cache=(
         "$HOME/.cache/thumbnails" "$HOME/.cache/fontconfig"
         "$HOME/.cache/dconf" "$HOME/.cache/wallpaper"
+        "$HOME/.cache/mesa_shader_cache" "$HOME/.cache/electron"
+        "$HOME/.cache/menus" "$HOME/.cache/event-sound-catalog.tdb"
+        "$HOME/.cache/node-gyp" "$HOME/.cache/go-build"
     )
     for c in "${sys_cache[@]}"; do antes=$((antes + $(tamano_de "$c") )); done
     for c in "${sys_cache[@]}"; do
-        [[ -d "$c" ]] && { spinner "Sistema: $(basename "$c")" rm -rf "$c"; }
+        [[ -d "$c" || -f "$c" ]] && { spinner "Sistema: $(basename "$c")" rm -rf "$c"; }
     done
 
-    # ── Logs del sistema (vacuum) ──
+    # ── Logs del sistema (vacuum) y núcleos de crash antiguos ──
     if command -v journalctl >/dev/null 2>&1; then
         spinner "Sistema: reduciendo logs a 7 días" sudo journalctl --vacuum-time=7d
+    fi
+    if [[ -d /var/lib/systemd/coredump ]]; then
+        local core_old
+        core_old=$(sudo find /var/lib/systemd/coredump -type f -mtime +7 2>/dev/null | wc -l)
+        if (( core_old > 0 )); then
+            if confirmar "¿Eliminar ${core_old} volcados de memoria (coredumps) de hace más de 7 días?"; then
+                sudo find /var/lib/systemd/coredump -type f -mtime +7 -delete 2>/dev/null
+                echo -e "   ${GREEN}✔ Coredumps antiguos eliminados${RESET}"
+            fi
+        fi
     fi
 
     # ── Reporte final ──────────────────────────────
@@ -1067,7 +1084,32 @@ errores_hardware() {
     fi
     echo ""
 
-    # 3) Temperatura
+    # 3) Errores de NVMe y de memoria (ECC/MCE): señales de mayor certeza.
+    echo -e "${BOLD}▸ Errores NVMe y de memoria (ECC/MCE):${RESET}"
+    local hay_nvme_err=0 hay_mem_err=0
+    while IFS= read -r dev_name; do
+        [[ -n "$dev_name" ]] || continue
+        local entradas nerrors
+        entradas=$(sudo smartctl -l error "/dev/$dev_name" 2>/dev/null | grep -i 'Error Information Log Entries' | grep -oE '[0-9]+' | head -1)
+        [[ -z "$entradas" ]] && continue
+        (( entradas > 0 )) && hay_nvme_err=1
+        echo "      /dev/$dev_name: $entradas entrada(s) de error registrada(s)"
+    done < <(lsblk -dno NAME 2>/dev/null | grep -E '^nvme[0-9]n[0-9]+$')
+    local mce
+    mce=$(journalctl -k --no-pager --since "7 days ago" 2>/dev/null | grep -icE 'machine check|mce:|uncorrected|Hardware Error|CE\b|UE\b' || true)
+    if (( mce > 0 )); then
+        hay_mem_err=1
+        echo "      MCE / hardware: ${mce} evento(s); puede apuntar a RAM defectuosa (memtest86+)"
+    fi
+    if command -v edac-util >/dev/null 2>&1; then
+        sudo edac-util --report 2>/dev/null | head -10
+    fi
+    if (( hay_nvme_err == 0 )) && (( hay_mem_err == 0 )); then
+        echo -e "   ${GREEN}✔ Sin errores NVMe ni de memoria detectados recientemente.${RESET}"
+    fi
+    echo ""
+
+    # 4) Temperatura
     echo -e "${BOLD}▸ Temperatura del sistema:${RESET}"
     if command -v sensors >/dev/null; then
         local info
@@ -1098,6 +1140,9 @@ errores_hardware() {
     senales_fuertes=$(printf '%s\n' "$kernel_raw" | grep -iE \
         'Hardware Error|Machine Check|MCE|uncorrectable|ECC.*error|panic:|Oops:|BUG:|kernel BUG|fatal|hotplug|I/O error|No such device|failed command|CE\b|UE\b' | head -8 || true)
     senales_debiles=$(printf '%s\n' "$kernel_raw" | grep -iE 'error|fail|critical|fault|thermal|nvme|pcie|usb' | head -8 || true)
+    if (( hay_nvme_err == 1 || hay_mem_err == 1 )); then
+        senales_fuertes="${senales_fuertes}"$'\n'"registros de error NVMe/MCE (ver sección 3)"
+    fi
 
     # Estado de los discos (referencia cruzada): si algún disco ha fallado
     # en salud SMART, es señal fuerte.
@@ -1187,23 +1232,77 @@ analizar_a_fondo_errores() {
 }
 
 # ─── Optimización rápida (un solo clic) ─────────────────
+
+# Aplica un sysctl de forma segura y lo anota para persistirlo.
+aplicar_sysctl() {
+    local clave="$1" valor="$2"
+    if sudo sysctl -w "$clave=$valor" >/dev/null 2>&1; then
+        echo -e "   ${GREEN}✔${RESET} $clave = $valor"
+        KYRO_SYSCTL+=("$clave=$valor")
+        return 0
+    fi
+    echo -e "   ${YELLOW}⚠${RESET} $clave (no aplicable)"
+    return 1
+}
+
+# Guarda una lista de "clave=valor" en /etc/sysctl.d (persistencia).
+guardar_sysctls() {
+    local archivo="$1"; shift
+    local elem lista=""
+    for elem in "$@"; do lista+="$elem"$'\n'; done
+    if printf '%s' "$lista" | sudo tee "/etc/sysctl.d/$archivo" >/dev/null 2>&1; then
+        echo -e "   ${GREEN}✔ Guardado en /etc/sysctl.d/$archivo${RESET}"
+        return 0
+    fi
+    echo -e "   ${YELLOW}⚠ No se pudo guardar la persistencia.${RESET}"
+    return 1
+}
+
 optimizacion_rapida() {
     clear
     echo -e "${CYAN}${BOLD}╭─ Optimización rápida ─────────────────────────────────────────────╮${RESET}"
-    echo -e "${CYAN}│${RESET} Aplicará los ajustes de rendimiento seguros recomendados.${CYAN}"
+    echo -e "${CYAN}│${RESET} Ajustes de rendimiento seguros aplicados de forma automática.${CYAN}"
     echo -e "${CYAN}╰──────────────────────────────────────────────────────────────────╯${RESET}"
     echo ""
     if ! confirmar "¿Deseas aplicar tweaks seguros ahora?"; then
         echo -e "${YELLOW}Cancelado.${RESET}"
         return
     fi
+    echo ""
+    KYRO_SYSCTL=()
 
-    local ram_mb sw
+    # ── Detección del entorno ──
+    local ram_mb sw vcp dirty_bg dirty comp page_cluster sched_rec
     ram_mb=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}')
     [[ -z "$ram_mb" ]] && ram_mb=0
     if (( ram_mb >= 16384 )); then sw=5; elif (( ram_mb >= 8192 )); then sw=10; else sw=30; fi
 
-    # gobernador
+    local dev rotational tipo_disco="SSD"
+    dev=$(detectar_dispositivo_base)
+    rotational=$(cat "/sys/block/$dev/queue/rotational" 2>/dev/null || echo 0)
+    if [[ "$dev" == nvme* ]]; then
+        tipo_disco="SSD (NVMe)"; sched_rec="none"
+    elif [[ "$rotational" == "0" ]]; then
+        tipo_disco="SSD"; sched_rec="mq-deadline"
+    else
+        tipo_disco="HDD"; sched_rec="bfq"
+    fi
+    vcp=50
+    if (( ram_mb >= 16384 )); then dirty_bg=3; dirty=10; else dirty_bg=5; dirty=15; fi
+    comp=10
+    if [[ "$tipo_disco" == "SSD" || "$tipo_disco" == "SSD (NVMe)" ]]; then page_cluster=0; else page_cluster=3; fi
+
+    # ── Memoria virtual (sysctl) ──
+    echo -e "${BOLD}▸ Memoria virtual (sysctl):${RESET}"
+    aplicar_sysctl "vm.swappiness" "$sw"
+    aplicar_sysctl "vm.vfs_cache_pressure" "$vcp"
+    aplicar_sysctl "vm.dirty_background_ratio" "$dirty_bg"
+    aplicar_sysctl "vm.dirty_ratio" "$dirty"
+    aplicar_sysctl "vm.page-cluster" "$page_cluster"
+    aplicar_sysctl "vm.compaction_proactiveness" "$comp"
+    echo ""
+
+    # ── Gobernador de CPU ──
     local gov="performance"
     compgen -G "/sys/class/power_supply/BAT*" >/dev/null 2>&1 && gov="powersave"
     if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors ]]; then
@@ -1213,31 +1312,89 @@ optimizacion_rapida() {
             gov=$(echo "$avail" | awk '{print $1}')
         fi
     fi
-
-    # scheduler
-    local dev sched
-    dev=$(detectar_dispositivo_base)
-    if [[ -f "/sys/block/$dev/queue/scheduler" ]]; then
-        sched=$(echo "$(cat /sys/block/$dev/queue/scheduler)" | grep -oP '\[\K[^]]+' 2>/dev/null)
-        [[ -z "$sched" ]] && sched=$(echo "$(cat /sys/block/$dev/queue/scheduler)" | awk '{print $1}')
-    fi
-
-    echo -e "${BOLD}→ Aplicando vm.swappiness=${sw} ...${RESET}"
-    sudo sysctl -w vm.swappiness="$sw" >/dev/null 2>&1 && echo -e "   ${GREEN}✔${RESET}" || echo -e "   ${RED}✘${RESET}"
-    echo -e "${BOLD}→ Gobernador CPU: ${gov} ...${RESET}"
+    echo -e "${BOLD}▸ Gobernador de CPU: ${gov}${RESET}"
     local govok=0
     for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
         [[ -f "$g" ]] && echo "$gov" | sudo tee "$g" >/dev/null 2>&1 && govok=1
     done
-    [[ "$govok" -eq 1 ]] && echo -e "   ${GREEN}✔${RESET}" || echo -e "   ${YELLOW}⚠ sin cpufreq${RESET}"
-    if [[ -n "${sched:-}" && -f "/sys/block/$dev/queue/scheduler" ]]; then
-        echo -e "${BOLD}→ Planificador ${sched} en $dev ...${RESET}"
-        echo "$sched" | sudo tee "/sys/block/$dev/queue/scheduler" >/dev/null 2>&1 && echo -e "   ${GREEN}✔${RESET}" || echo -e "   ${YELLOW}⚠${RESET}"
+    [[ "$govok" -eq 1 ]] && echo -e "   ${GREEN}✔${RESET}" || echo -e "   ${YELLOW}⚠ sin cpufreq (se omite)${RESET}"
+    echo ""
+
+    # ── Planificador E/S en todos los discos ──
+    echo -e "${BOLD}▸ Planificador de E/S (${sched_rec}) en todos los discos:${RESET}"
+    local sched_ok=0 q
+    for q in /sys/block/*/queue/scheduler; do
+        [[ -f "$q" ]] || continue
+        if echo "$(cat "$q" 2>/dev/null)" | tr ' ' '\n' | sed 's/\[//;s/\]//' | grep -qx "$sched_rec"; then
+            echo "$sched_rec" | sudo tee "$q" >/dev/null 2>&1 && sched_ok=1
+        fi
+    done
+    [[ "$sched_ok" -eq 1 ]] && echo -e "   ${GREEN}✔ aplicado${RESET}" || echo -e "   ${YELLOW}⚠ sin discos ajustables${RESET}"
+    echo ""
+
+    # ── Persistencia ──
+    echo -e "${BOLD}▸ Persistencia:${RESET}"
+    if confirmar "  → ¿Guardar estos ajustes para que apliquen en cada arranque?"; then
+        persistir_ajustes_rapidos "$gov" "$sched_rec"
+    else
+        echo -e "   ${DIM}Los cambios durarán hasta el próximo reinicio.${RESET}"
     fi
-    registrar_ultima_accion "Optimización rápida (gov=$gov, swappiness=$sw)"
+
+    registrar_ultima_accion "Optimización rápida ($tipo_disco, gov=$gov, swappiness=$sw)"
     echo ""
     echo -e "${GREEN}✔ Optimización rápida finalizada${RESET}"
     pause
+}
+
+# Servicio systemd para persistir la optimización rápida entre reinicios.
+persistir_ajustes_rapidos() {
+    local gov="$1" sched="$2"
+    local bin="/usr/local/bin/kyro-quick-apply.sh"
+    local svc="/etc/systemd/system/kyro-quick.service"
+    local tmpbin l
+    tmpbin=$(mktemp)
+
+    cat > "$tmpbin" <<EOF
+#!/bin/bash
+# Generado por Kyro (optimización rápida). No editar a mano.
+for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+    [ -w "\$g" ] && echo "$gov" > "\$g" 2>/dev/null
+done
+for q in /sys/block/*/queue/scheduler; do
+    if grep -q "$sched" "\$q" 2>/dev/null; then
+        [ -w "\$q" ] && echo "$sched" > "\$q" 2>/dev/null
+    fi
+done
+EOF
+    for l in "${KYRO_SYSCTL[@]}"; do
+        echo "sysctl -w \"$l\" >/dev/null 2>&1" >> "$tmpbin"
+    done
+
+    if sudo install -m 755 "$tmpbin" "$bin" >/dev/null 2>&1; then
+        sudo tee "$svc" >/dev/null <<EOF
+[Unit]
+Description=Ajustes de rendimiento rápidos de Kyro
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=$bin
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        sudo systemctl daemon-reload >/dev/null 2>&1
+        if sudo systemctl enable --now kyro-quick.service >/dev/null 2>&1; then
+            echo -e "   ${GREEN}✔ Ajustes persistentes (kyro-quick.service)${RESET}"
+        else
+            echo -e "   ${YELLOW}⚠ Script guardado, pero no se pudo activar el servicio.${RESET}"
+        fi
+        rm -f "$tmpbin"
+        return 0
+    fi
+    rm -f "$tmpbin"
+    echo -e "   ${RED}✘ No se pudo escribir el script persistente (¿sudo?).${RESET}"
+    return 1
 }
 
 # ─━━─ Panel en vivo ─────────────────────────────────
@@ -1318,6 +1475,11 @@ limpiar_caches_apps() {
         "$HOME/.npm" "$HOME/.cache/npm" "$HOME/.cache/yarn"
         "$HOME/.cache/pnpm" "$HOME/.cache/cargo" "$HOME/.cache/go-build"
         "$HOME/.cache/composer" "$HOME/.cache/ms-playwright"
+        "$HOME/.cache/pypoetry" "$HOME/.cache/pipenv" "$HOME/.cache/poetry"
+        "$HOME/.cache/deno" "$HOME/.cache/bun" "$HOME/.cache/electron"
+        "$HOME/.cache/node-gyp" "$HOME/.cache/mesa_shader_cache"
+        "$HOME/.cache/hugo_cache" "$HOME/.cache/parcel" "$HOME/.gradle/caches"
+        "$HOME/.cache/rustls" "$HOME/.cache/mix" "$HOME/.cache/mypy_cache"
     )
     local antes=0 despues=0 d liberado=0
     for d in "${dirs[@]}"; do
@@ -1325,8 +1487,12 @@ limpiar_caches_apps() {
     done
 
     if command -v flatpak >/dev/null 2>&1; then
+        antes=$(( antes + $(tamano_de "$HOME/.var/app") ))
         if confirmar "¿Eliminar runtimes/paquetes Flatpak no utilizados?"; then
-            spinner "Flatpak: limpiando lo no usado" flatpak uninstall --unused --yes
+            spinner "Flatpak: limpiando lo no usado" flatpak uninstall --unused --assumeyes
+        fi
+        if confirmar "¿Vaciar caché de Flatpak?"; then
+            rm -rf "$HOME/.var/app"/*/cache 2>/dev/null || true
         fi
     fi
     if command -v pip3 >/dev/null 2>&1; then
@@ -1335,8 +1501,17 @@ limpiar_caches_apps() {
     if command -v npm >/dev/null 2>&1; then
         spinner "npm: vaciando caché" npm cache clean --force --loglevel=error
     fi
+    if command -v yarn >/dev/null 2>&1; then
+        spinner "yarn: vaciando caché" yarn cache clean 2>/dev/null || true
+    fi
+    if command -v pnpm >/dev/null 2>&1; then
+        spinner "pnpm: vaciando caché" pnpm store prune 2>/dev/null || true
+    fi
     if command -v uv >/dev/null 2>&1; then
         spinner "uv: vaciando caché" uv cache clean
+    fi
+    if command -v poetry >/dev/null 2>&1; then
+        spinner "poetry: vaciando caché" poetry cache clear --all . 2>/dev/null || true
     fi
     if command -v cargo >/dev/null 2>&1; then
         spinner "cargo: limpiando caché" cargo cache --autoclean 2>/dev/null || true
@@ -1345,10 +1520,25 @@ limpiar_caches_apps() {
     if command -v go >/dev/null 2>&1; then
         spinner "Go: limpiando caché de build" go clean -cache 2>/dev/null || true
     fi
+    if command -v gradle >/dev/null 2>&1; then
+        spinner "gradle: podando caché" gradle --stop 2>/dev/null; rm -rf "$HOME/.gradle/wrapper/dists" 2>/dev/null || true
+    fi
+    if command -v docker >/dev/null 2>&1 && confirmar "¿Podar imágenes y caches de Docker (contenedores parados quedarán a salvo)? [y/N]" ; then
+        sudo docker builder prune -f 2>/dev/null || true
+        sudo docker image prune -f 2>/dev/null || true
+    fi
+    if command -v podman >/dev/null 2>&1; then
+        # -a elimina imágenes sin usar; no borra contenedores activos.
+        sudo podman system prune -af 2>/dev/null || true
+    fi
+    if command -v composer >/dev/null 2>&1; then
+        rm -rf "$HOME/.cache/composer" 2>/dev/null || true
+    fi
 
     for d in "${dirs[@]}"; do
         despues=$(( despues + $(tamano_de "$d") ))
     done
+    despues=$(( despues + $(tamano_de "$HOME/.var/app") ))
     liberado=$(( antes - despues ))
     (( liberado < 0 )) && liberado=0
     echo -e "${GREEN}✔ Cachés de aplicaciones limpias${RESET}  ${DIM}($(formatear_bytes "$liberado") liberados)${RESET}"
@@ -1453,27 +1643,122 @@ revisar_pacnew() {
         echo -e "${GREEN}✔ No hay archivos .pacnew ni .pacsave${RESET}"
     else
         echo -e "${YELLOW}⚠ ${total} archivo(s) pendientes de revisar:${RESET}"
-        sed 's/^/   - /' "$tmpfile"
-        local f b
         while IFS= read -r f; do
             [[ -z "$f" ]] && continue
+            local sz fecha
+            sz=$(du -h "$f" 2>/dev/null | awk '{print $1}')
+            fecha=$(stat -c '%y' "$f" 2>/dev/null | cut -d' ' -f1)
+            printf "   - %-45s  [%s, %s]\n" "$f" "$sz" "$fecha"
+        done < "$tmpfile"
+        echo ""
+
+        local decidir_todos=0 aplicados=0 movidos=0 ignorados=0 f b opc salir=0
+        while IFS= read -r f <&3; do
+            [[ -z "$f" ]] && continue
+            (( decidir_todos != 0 )) && salir=1 && break
+            [[ "$salir" -eq 1 ]] && break
+
             if [[ "$f" == *.pacnew ]]; then
                 b=${f%.pacnew}
-                if confirmar "¿Aplicar ${f}? (backup de '${b}' se guarda como .pacsave)"; then
+                echo -e "${BOLD}── ${f}${RESET}  ${DIM}(es la nueva versión de ${b})${RESET}"
+                while true; do
+                    read -rp "   (v)er diff  (a)plicar  (i)gnorar  (t)odos  (s)alir: " opc || opc="s"
+                    case "${opc,,}" in
+                        v)
+                            ver_diff_pacnew "$b" "$f"
+                            ;;
+                        a)
+                            sudo cp -a "$b" "$b.pacsave" 2>/dev/null || true
+                            sudo cp -a "$f" "$b" 2>/dev/null && echo -e "   ${GREEN}✔ ${b} actualizado (backup: ${b}.pacsave)${RESET}"
+                            aplicados=$((aplicados + 1))
+                            break
+                            ;;
+                        i)
+                            ignorados=$((ignorados + 1))
+                            break
+                            ;;
+                        t)
+                            decidir_todos=1
+                            break
+                            ;;
+                        s|q)
+                            salir=1
+                            break
+                            ;;
+                    esac
+                done
+                if [[ "$decidir_todos" -eq 1 ]]; then
                     sudo cp -a "$b" "$b.pacsave" 2>/dev/null || true
-                    sudo cp -a "$f" "$b" 2>/dev/null
-                    echo -e "${GREEN}✔ ${b} actualizado${RESET}"
+                    sudo cp -a "$f" "$b" 2>/dev/null && echo -e "   ${GREEN}✔ ${b} actualizado (todos)${RESET}"
+                    aplicados=$((aplicados + 1))
                 fi
-            elif confirmar "¿Mover ${f} a $HOME/backups-pacnew?"; then
-                mkdir -p "$HOME/backups-pacnew"
-                sudo mv "$f" "$HOME/backups-pacnew/" 2>/dev/null
-                echo -e "${GREEN}✔ Archivo movido a backups-pacnew${RESET}"
+            else
+                # .pacsave: versión antigua guardada; ofrecemos ver/restaurar/ignorar.
+                b=${f%.pacsave}
+                echo -e "${BOLD}── ${f}${RESET}  ${DIM}(es una copia de seguridad antigua de ${b})${RESET}"
+                while true; do
+                    read -rp "   (v)er diff  (r)estaurar  (i)gnorar  (t)odos  (s)alir: " opc || opc="s"
+                    case "${opc,,}" in
+                        v)
+                            ver_diff_pacnew "$f" "$b"
+                            ;;
+                        r)
+                            sudo cp -a "$f" "$b" 2>/dev/null && echo -e "   ${GREEN}✔ ${b} restaurado desde el backup${RESET}"
+                            aplicados=$((aplicados + 1))
+                            break
+                            ;;
+                        i)
+                            ignorados=$((ignorados + 1))
+                            break
+                            ;;
+                        t)
+                            decidir_todos=1
+                            break
+                            ;;
+                        s|q)
+                            salir=1
+                            break
+                            ;;
+                    esac
+                done
+                if [[ "$decidir_todos" -eq 1 ]]; then
+                    sudo cp -a "$f" "$b" 2>/dev/null && echo -e "   ${GREEN}✔ ${b} restaurado (todos)${RESET}"
+                    aplicados=$((aplicados + 1))
+                fi
             fi
-        done < "$tmpfile"
+        done 3< "$tmpfile"
+        echo ""
+        echo -e "${BOLD}Resumen:${RESET} ${aplicados} aplicado(s), ${ignorados} ignorado(s)"
+        if (( decidir_todos == 1 )); then
+            echo -e "${DIM}   (resto del archivo: decisión 'todos' detiene la lista)${RESET}"
+        fi
+        registrar_ultima_accion "Revisión de .pacnew/.pacsave (${aplicados} aplicados, ${ignorados} ignorados)"
     fi
     rm -f "$tmpfile"
-    registrar_ultima_accion "Revisión de .pacnew/.pacsave (${total})"
     pause
+}
+
+# Muestra las diferencias entre dos archivos (pipe a less si está disponible).
+ver_diff_pacnew() {
+    local a="$1" b="$2" out
+    if [[ -r "$a" ]] && [[ -r "$b" ]]; then
+        if command -v colordiff >/dev/null 2>&1; then
+            out=$(colordiff -u "$a" "$b" 2>/dev/null)
+        else
+            out=$(diff -u "$a" "$b" 2>/dev/null)
+        fi
+        if [[ -z "$out" ]]; then
+            echo -e "   ${DIM}Sin diferencias entre ambos archivos.${RESET}"
+            return 0
+        fi
+        if command -v less >/dev/null 2>&1; then
+            printf '%s\n' "$out" | less -R
+        else
+            printf '%s\n' "$out"
+        fi
+    else
+        echo -e "${YELLOW}   No se pudieron leer los archivos para comparar.${RESET}"
+    fi
 }
 
 # 18) Diagnóstico de red y DNS
@@ -1686,8 +1971,8 @@ servicios_fallidos() {
         awk '{print "   - " $1}' "$tmpfile"
         if confirmar "¿Intentar reiniciar estos servicios?"; then
             local ok=0 fail=0 reparados=0
-            while read -r linea; do
-                local unidad
+            local linea unidad
+            while IFS= read -r linea <&3; do
                 unidad=$(echo "$linea" | awk '{print $1}')
                 [[ -z "$unidad" ]] && continue
                 if sudo systemctl restart "$unidad" 2>/dev/null; then
@@ -1696,26 +1981,43 @@ servicios_fallidos() {
                 else
                     # Reparación automática de swaps rotos (típico en btrfs).
                     if [[ "$unidad" == *.swap ]]; then
-                        local src sz mb reparado=0
+                        local src mb reparado=0 ram_mb rec_mb
                         src=$(systemctl show -p What --value "$unidad" 2>/dev/null)
-                        if [[ -n "$src" ]] && [[ -f "$src" ]]; then
+                        # Si systemd no reporta la ruta, se infiere del nombre
+                        # de la unidad (swapfile_kyro.swap -> /swapfile_kyro).
+                        if [[ -z "$src" ]]; then
+                            src=$(systemd-escape -p --unescape "${unidad%.swap}" 2>/dev/null)
+                            [[ -e "$src" ]] || src="/swapfile_kyro"
+                        fi
+                        # Tamaño objetivo basado en la RAM (mín. 1 GB).
+                        ram_mb=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}')
+                        [[ -z "$ram_mb" ]] && ram_mb=4096
+                        (( ram_mb > 16384 )) && rec_mb=4096 || rec_mb=$((ram_mb / 2))
+                        (( rec_mb < 1024 )) && rec_mb=1024
+                        # Si el archivo existe, recuperamos su tamaño real.
+                        if [[ -f "$src" ]]; then
+                            local sz
                             sz=$(stat -c %s "$src" 2>/dev/null || echo 0)
-                            mb=$(( sz / 1048576 ))
-                            (( mb < 64 )) && mb=4096
-                            if confirmar "  → El swap '$src' está roto. ¿Reconstruirlo automáticamente (~${mb} MB)?"; then
-                                if crear_archivo_swap "$mb" "$src"; then
-                                    sudo systemctl reset-failed "$unidad" 2>/dev/null
-                                    if sudo systemctl restart "$unidad" 2>/dev/null; then
-                                        echo -e "${GREEN}✔ ${unidad} reparado y en marcha${RESET}"
-                                        ok=$((ok + 1))
-                                        reparados=$((reparados + 1))
-                                        reparado=1
-                                    fi
+                            (( sz / 1048576 > rec_mb )) && rec_mb=$((sz / 1048576))
+                        fi
+                        if confirmar "  → El swap '$src' no funciona. ¿Reconstruirlo automáticamente (~${rec_mb} MB)?"; then
+                            # Desactiva el swap y la unidad antes de reconstruir,
+                            # evitando el fallo "dispositivo en uso".
+                            sudo swapon -s 2>/dev/null | grep -qF "$src" && sudo swapoff "$src" 2>/dev/null || true
+                            sudo systemctl stop "$unidad" 2>/dev/null || true
+                            if crear_archivo_swap "$rec_mb" "$src"; then
+                                sudo systemctl reset-failed "$unidad" 2>/dev/null || true
+                                if sudo systemctl restart "$unidad" 2>/dev/null || sudo swapon -a 2>/dev/null; then
+                                    echo -e "${GREEN}✔ ${unidad} reparado y en marcha${RESET}"
+                                    ok=$((ok + 1))
+                                    reparados=$((reparados + 1))
+                                    reparado=1
                                 fi
                             fi
                         fi
                         if [[ "$reparado" -eq 0 ]]; then
                             echo -e "${RED}✘ No se pudo recuperar ${unidad}${RESET}"
+                            echo -e "${DIM}   Diagnóstico: journalctl -u ${unidad} --no-pager | tail -20${RESET}"
                             fail=$((fail + 1))
                         fi
                     else
@@ -1724,19 +2026,20 @@ servicios_fallidos() {
                         fail=$((fail + 1))
                     fi
                 fi
-            done < "$tmpfile"
-            if (( reparados > 0 )); then
-                echo -e "${GREEN}✔ ${reparados} unit(s) de swap reconstruidos correctamente${RESET}"
+            done 3< "$tmpfile"
+                if (( reparados > 0 )); then
+                    echo -e "${GREEN}✔ ${reparados} unit(s) de swap reconstruidos correctamente${RESET}"
+                fi
+                registrar_ultima_accion "Servicios reiniciados (${ok} ok, ${fail} fallidos)"
+            else
+                registrar_ultima_accion "Revisión de servicios fallidos (${total} encontrados)"
             fi
-            registrar_ultima_accion "Servicios reiniciados (${ok} ok, ${fail} fallidos)"
-        else
-            registrar_ultima_accion "Revisión de servicios fallidos (${total} encontrados)"
         fi
-    fi
 
-    rm -f "$tmpfile"
-    pause
-}
+        rm -f "$tmpfile"
+        pause
+    }
+
 
 # ═══════════════════════════════════════════════════════
 #  FUNCIONES NUEVAS: ACTUALIZACIONES Y README
@@ -1812,6 +2115,23 @@ comprobar_update_fondo() {
     fi
 }
 
+# Sustituye el script actual por uno recién descargado de forma robusta:
+# - `install` copia el contenido y escribe en el destino (sirve entre
+#   dispositivos distintos, p. ej. /tmp → /usr/local/bin).
+# - Usa sudo si el directorio destino no es escribible por el usuario
+#   (instalaciones en /usr/local/bin, /usr/bin, etc.).
+reemplazar_script() {
+    local tmp="$1" dest="$2" dir upd=0
+    dir=$(dirname "$dest")
+    if [[ -w "$dir" ]]; then
+        install -m 755 "$tmp" "$dest" 2>/dev/null && upd=1
+    fi
+    if [[ "$upd" -eq 0 ]]; then
+        sudo install -m 755 "$tmp" "$dest" 2>/dev/null && upd=1
+    fi
+    [[ "$upd" -eq 1 ]]
+}
+
 # actualizaciones_auto: revisa si hay una nueva versión y,
 # si existe, ofrece actualizarla manualmente (como un "botón").
 actualizaciones_auto() {
@@ -1847,12 +2167,14 @@ actualizaciones_auto() {
         echo -e "${YELLOW}Descargando Kyro ${remota}...${RESET}"
         if descargar_script_remoto "$tmp"; then
             # Sustituye el script actual por el nuevo y lo deja ejecutable.
-            if mv "$tmp" "$SCRIPT_PATH" && chmod +x "$SCRIPT_PATH"; then
+            if reemplazar_script "$tmp" "$SCRIPT_PATH" && chmod +x "$SCRIPT_PATH" 2>/dev/null; then
                 echo -e "${GREEN}✔ Kyro actualizado a ${remota}. Se relanzará con la nueva versión.${RESET}"
                 registrar_ultima_accion "Actualización de Kyro (${VERSION} → ${remota})"
+                rm -f "$tmp"
                 exec bash "$SCRIPT_PATH"
             else
                 echo -e "${RED}✘ No se pudo reemplazar el script (permisos?).${RESET}"
+                echo -e "${DIM}   Intenta manualmente: sudo install -m 755 '$tmp' '$SCRIPT_PATH'${RESET}"
                 rm -f "$tmp"
             fi
         else
@@ -1896,9 +2218,14 @@ Optimizador y herramienta de mantenimiento del sistema para Linux.
 
 - Limpia la caché en un solo toque: gestor oficial, AUR, navegadores, AppImage y sistema.
 - Optimiza hardware: CPU, RAM, swap, planificador de E/S y gobernador.
-- Detecta y diagnostica errores de hardware (SMART, kernel, temperatura).
+- Optimización rápida persistente: sysctl, gobernador y planificadores en todos los discos.
+- Optimización de red: TCP BBR, colas fq y buffers (persistente).
+- Detecta y diagnostica errores de hardware (SMART, NVMe, ECC/MCE, temperatura).
+- Chequeo de salud completo con resumen ok/aviso/crítico.
 - Analiza directorios vacíos, integridad de paquetes y archivos grandes.
+- Revisa y aplica archivos .pacnew / .pacsave interactivamente (con diff).
 - Repara servicios systemd fallidos (incluidos swaps rotos en btrfs).
+- Limpieza profunda opcional: coredumps, Snap/Flatpak/Docker/Podman.
 - Monitoriza CPU, RAM y temperatura en tiempo real.
 - Se actualiza automáticamente a sí mismo (¡eso hace este mismo archivo!).
 
@@ -1941,6 +2268,269 @@ abrir_readme() {
     pause
 }
 
+# ─── 21) Optimización de red (TCP BBR, colas fq y buffers) ─────
+optimizar_red() {
+    clear
+    echo -e "${CYAN}${BOLD}╭─ Optimización de red ──────────────────────────────────────────────╮${RESET}"
+    echo -e "${CYAN}│${RESET} TCP BBR, colas fq y buffers más amplios (seguros y reversibles).${CYAN}"
+    echo -e "${CYAN}╰──────────────────────────────────────────────────────────────────╯${RESET}"
+    echo ""
+    if ! confirmar "¿Aplicar la optimización de red ahora?"; then
+        echo -e "${YELLOW}Cancelado.${RESET}"
+        return
+    fi
+    echo ""
+    KYRO_NET=()
+
+    echo -e "${BOLD}▸ Control de congestión (BBR):${RESET}"
+    local bbr_ok=0 k v kv
+    if grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+        bbr_ok=1
+    elif sudo modprobe tcp_bbr 2>/dev/null; then
+        bbr_ok=1
+    fi
+    if (( bbr_ok == 1 )); then
+        for kv in "net.core.default_qdisc=fq" "net.ipv4.tcp_congestion_control=bbr"; do
+            k=${kv%%=*}; v=${kv#*=}
+            if sudo sysctl -w "$k=$v" >/dev/null 2>&1; then
+                echo -e "   ${GREEN}✔${RESET} $k = $v"
+                KYRO_NET+=("$kv")
+            else
+                echo -e "   ${YELLOW}⚠${RESET} $k (no aplicable)"
+            fi
+        done
+    else
+        echo -e "   ${YELLOW}⚠ BBR no disponible (módulo tcp_bbr). Se aplicarán solo los buffers.${RESET}"
+    fi
+    echo ""
+
+    echo -e "${BOLD}▸ Buffers, colas y temporizadores:${RESET}"
+    local net=(
+        "net.core.rmem_max=134217728"
+        "net.core.wmem_max=134217728"
+        "net.ipv4.tcp_rmem=4096 87380 134217728"
+        "net.ipv4.tcp_wmem=4096 65536 134217728"
+        "net.ipv4.tcp_fastopen=3"
+        "net.core.netdev_max_backlog=16384"
+        "net.ipv4.tcp_slow_start_after_idle=0"
+        "net.ipv4.tcp_mtu_probing=1"
+        "net.core.somaxconn=1024"
+        "net.ipv4.tcp_max_syn_backlog=1024"
+    )
+    for kv in "${net[@]}"; do
+        k=${kv%%=*}; v=${kv#*=}
+        if sudo sysctl -w "$k=$v" >/dev/null 2>&1; then
+            echo -e "   ${GREEN}✔${RESET} $k = $v"
+            KYRO_NET+=("$kv")
+        else
+            echo -e "   ${YELLOW}⚠${RESET} $k (no aplicable)"
+        fi
+    done
+    echo ""
+
+    echo -e "${BOLD}▸ Persistencia:${RESET}"
+    if confirmar "  → ¿Guardar estos ajustes para cada arranque?"; then
+        guardar_sysctls "99-kyro-network.conf" "${KYRO_NET[@]}"
+    else
+        echo -e "   ${DIM}Los cambios durarán hasta el próximo reinicio.${RESET}"
+    fi
+    registrar_ultima_accion "Optimización de red (BBR + buffers, ${#KYRO_NET[@]} sysctls)"
+    echo ""
+    echo -e "${GREEN}✔ Optimización de red finalizada${RESET}"
+    pause
+}
+
+# ─── 22) Chequeo de salud completo ─────────────────────
+chequeo_salud() {
+    clear
+    echo -e "${CYAN}${BOLD}╭─ Chequeo de salud del sistema ──────────────────────────────────────╮${RESET}"
+    echo -e "${CYAN}│${RESET} Revisión rápida de los puntos críticos de tu equipo.${CYAN}"
+    echo -e "${CYAN}╰──────────────────────────────────────────────────────────────────╯${RESET}"
+    echo ""
+    local ok=0 warn=0 crit=0 items=()
+
+    # ── Carga y CPU ──
+    local load nproc pct
+    read -r load _ _ _ _ <<< "$(cat /proc/loadavg 2>/dev/null)"
+    load=${load:-0}
+    nproc=$(nproc 2>/dev/null || echo 1)
+    pct=$(awk -v l="$load" -v n="$nproc" 'BEGIN{printf "%d", (l/n)*100}')
+    if (( pct >= 100 )); then items+=("crit|Carga de CPU: $load ($pct% de $nproc núcleo(s))"); crit=$((crit+1))
+    elif (( pct > 60 )); then items+=("warn|Carga de CPU: $load ($pct% de $nproc núcleo(s))"); warn=$((warn+1))
+    else items+=("ok|Carga de CPU: $load ($pct% de $nproc núcleo(s))"); ok=$((ok+1)); fi
+
+    # ── RAM ──
+    local memtot memuse mempct
+    memtot=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}'); memuse=$(free -m 2>/dev/null | awk '/^Mem:/{print $3}')
+    mempct=$(free -m 2>/dev/null | awk '/^Mem:/{printf "%d", ($3/$2)*100}')
+    mempct=${mempct:-0}
+    if (( mempct >= 90 )); then items+=("crit|RAM: ${memuse}MB / ${memtot}MB (${mempct}%)"); crit=$((crit+1))
+    elif (( mempct >= 70 )); then items+=("warn|RAM: ${memuse}MB / ${memtot}MB (${mempct}%)"); warn=$((warn+1))
+    else items+=("ok|RAM: ${memuse}MB / ${memtot}MB (${mempct}%)"); ok=$((ok+1)); fi
+
+    # ── Swap ──
+    local swap_total
+    read -r swap_total _ _ <<< "$(info_swap)"
+    if (( swap_total > 0 )); then items+=("ok|Swap: $swap_total MB"); ok=$((ok+1))
+    else items+=("warn|Swap: sin swap (auméntalo con la opción 5)"); warn=$((warn+1)); fi
+
+    # ── Disco ──
+    local disk_used disk_total disk_pct
+    read -r disk_used disk_total disk_pct < <(df -h "$HOME" 2>/dev/null | awk 'NR==2 {gsub("%","",$5); print $3, $2, $5}')
+    disk_pct=${disk_pct:-0}
+    if (( disk_pct >= 90 )); then items+=("crit|Disco ($HOME): ${disk_used}/${disk_total} (${disk_pct}%)"); crit=$((crit+1))
+    elif (( disk_pct >= 70 )); then items+=("warn|Disco ($HOME): ${disk_used}/${disk_total} (${disk_pct}%)"); warn=$((warn+1))
+    else items+=("ok|Disco ($HOME): ${disk_used}/${disk_total} (${disk_pct}%)"); ok=$((ok+1)); fi
+
+    # ── Temperatura ──
+    local tempv=0 tempc
+    if command -v sensors >/dev/null 2>&1; then
+        tempc=$(sensors 2>/dev/null | grep -m1 -oE '[0-9]+\.[0-9]+°C' | grep -oE '^[0-9]+' | head -1)
+        [[ -n "$tempc" ]] && tempv=$tempc
+    elif compgen -G "/sys/class/thermal/thermal_zone*/temp" >/dev/null; then
+        local tz tv
+        for tz in /sys/class/thermal/thermal_zone*/temp; do
+            tv=$(cat "$tz" 2>/dev/null)
+            (( tv > tempv )) && tempv=$((tv / 1000))
+        done
+    fi
+    if (( tempv >= 85 )); then items+=("crit|Temperatura máx: ${tempv}°C"); crit=$((crit+1))
+    elif (( tempv >= 70 )); then items+=("warn|Temperatura máx: ${tempv}°C"); warn=$((warn+1))
+    elif (( tempv > 0 )); then items+=("ok|Temperatura máx: ${tempv}°C"); ok=$((ok+1))
+    else items+=("ok|Temperatura: sin sensores"); ok=$((ok+1)); fi
+
+    # ── SMART ──
+    local smart_hay=0 smart_fallos=0 dn
+    if command -v smartctl >/dev/null 2>&1; then
+        while IFS= read -r dn; do
+            [[ -n "$dn" ]] || continue
+            [[ -e "/dev/$dn" ]] || continue
+            if sudo smartctl -H "/dev/$dn" 2>/dev/null | grep -q 'FAILED'; then smart_fallos=$((smart_fallos + 1)); fi
+            smart_hay=1
+        done < <(lsblk -dno NAME 2>/dev/null | grep -E '^(sd[a-z]|nvme[0-9]n[0-9]+)$')
+    fi
+    if (( smart_fallos > 0 )); then items+=("crit|S.M.A.R.T.: $smart_fallos disco(s) en FALLO"); crit=$((crit+1))
+    elif (( smart_hay == 1 )); then items+=("ok|S.M.A.R.T.: discos sin fallos"); ok=$((ok+1))
+    else items+=("warn|S.M.A.R.T.: smartmontools no recomendado"); warn=$((warn+1)); fi
+
+    # ── Servicios fallidos ──
+    local failed
+    failed=$(systemctl --failed --no-legend --plain 2>/dev/null | wc -l)
+    if (( failed > 0 )); then items+=("warn|Servicios systemd fallidos: $failed (opción 11)"); warn=$((warn+1))
+    else items+=("ok|Servicios systemd: sin fallos"); ok=$((ok+1)); fi
+
+    # ── Kernel errors ──
+    local kerr
+    kerr=$(journalctl -k -p err --since "-7 days" -o cat 2>/dev/null | grep -icE 'error|fail|critical|panic|oops' || true)
+    if (( kerr > 20 )); then items+=("warn|Errores de kernel (7 días): $kerr (opción 7)"); warn=$((warn+1))
+    else items+=("ok|Errores de kernel (7 días): $kerr"); ok=$((ok+1)); fi
+
+    # ── .pacnew / huérfanos ──
+    local pacnew
+    pacnew=$(find /etc -type f \( -name '*.pacnew' -o -name '*.pacsave' \) 2>/dev/null | wc -l)
+    if (( pacnew > 0 )); then items+=("warn|Archivos .pacnew/.pacsave: $pacnew (opción 17)"); warn=$((warn+1))
+    else items+=("ok|Archivos .pacnew/.pacsave: 0"); ok=$((ok+1)); fi
+    local orphans
+    orphans=$(pacman -Qtdq 2>/dev/null | wc -l)
+    if (( orphans > 0 )); then items+=("warn|Paquetes huérfanos: $orphans (opción 2)"); warn=$((warn+1))
+    else items+=("ok|Paquetes huérfanos: 0"); ok=$((ok+1)); fi
+
+    # ── Mostrar ──
+    echo -e "${BOLD}Resultados:${RESET}"
+    local it lvl msg
+    for it in "${items[@]}"; do
+        lvl=${it%%|*}; msg=${it#*|}
+        case "$lvl" in
+            ok)   echo -e "   ${GREEN}✔${RESET} $msg" ;;
+            warn) echo -e "   ${YELLOW}⚠${RESET} $msg" ;;
+            crit) echo -e "   ${RED}✘${RESET} $msg" ;;
+        esac
+    done
+    echo ""
+    echo -e "${BOLD}Resumen:${RESET} ${GREEN}${ok} ok${RESET} · ${YELLOW}${warn} aviso(s)${RESET} · ${RED}${crit} crítico(s)${RESET}"
+    if (( crit > 0 || warn > 0 )); then
+        echo -e "${DIM}Resuelve los puntos pendientes con las opciones indicadas del menú.${RESET}"
+    else
+        echo -e "${GREEN}✔ Sistema en buen estado general.${RESET}"
+    fi
+    registrar_ultima_accion "Chequeo de salud (${ok} ok, ${warn} avisos, ${crit} críticos)"
+    pause
+}
+
+# ─── 23) Limpieza profunda (opcional, todo confirmado) ──
+limpieza_profunda() {
+    clear
+    echo -e "${CYAN}${BOLD}╭─ Limpieza profunda (opcional y segura) ────────────────────────────╮${RESET}"
+    echo -e "${CYAN}│${RESET} Elementos extra que se eliminan SOLO si confirmas cada uno.${CYAN}"
+    echo -e "${CYAN}╰──────────────────────────────────────────────────────────────────╯${RESET}"
+    echo ""
+    if ! confirmar "¿Comenzar la limpieza profunda?"; then
+        echo -e "${YELLOW}Cancelado.${RESET}"
+        return
+    fi
+    echo ""
+
+    if [[ -d /var/lib/systemd/coredump ]] && confirmar "→ ¿Eliminar volcados de memoria (coredumps) de más de 14 días?"; then
+        sudo find /var/lib/systemd/coredump -type f -mtime +14 -delete 2>/dev/null
+        echo -e "   ${GREEN}✔ Coredumps antiguos eliminados${RESET}"
+    fi
+
+    if command -v flatpak >/dev/null 2>&1 && confirmar "→ ¿Eliminar runtimes/paquetes Flatpak sin uso?"; then
+        flatpak uninstall --unused --assumeyes 2>/dev/null || true
+        spinner "Flatpak: caché" bash -c "rm -rf \"$HOME/.var/app\"/*/cache 2>/dev/null"
+    fi
+
+    if command -v snap >/dev/null 2>&1 && confirmar "→ ¿Limpiar revisiones antiguas (disables) de Snap?"; then
+        local sname srev
+        while read -r sname srev; do
+            [[ -n "$sname" && -n "$srev" ]] || continue
+            sudo snap remove "$sname" --revision="$srev" 2>/dev/null
+        done < <(sudo snap list --all 2>/dev/null | awk '/disabled/{print $1, $3}')
+        echo -e "   ${GREEN}✔ Snap: revisiones deshabilitadas eliminadas${RESET}"
+    fi
+
+    if command -v docker >/dev/null 2>&1 && confirmar "→ ¿Podar todo lo no usado de Docker (contenedores parados, redes e imágenes)? [y/N]"; then
+        sudo docker system prune -af 2>/dev/null || sudo docker system prune -f 2>/dev/null
+        echo -e "   ${GREEN}✔ Docker podado${RESET}"
+    fi
+
+    if command -v podman >/dev/null 2>&1 && confirmar "→ ¿Podar todo lo no usado de Podman?"; then
+        sudo podman system prune -af 2>/dev/null || true
+        echo -e "   ${GREEN}✔ Podman podado${RESET}"
+    fi
+
+    if command -v journalctl >/dev/null 2>&1 && confirmar "→ ¿Limitar los logs del sistema a 200 MB?"; then
+        sudo journalctl --vacuum-size=200M 2>/dev/null
+        echo -e "   ${GREEN}✔ Logs limitados a 200 MB${RESET}"
+    fi
+
+    local antes extras c liberado
+    antes=0
+    extras=(
+        "$HOME/.cache/electron" "$HOME/.cache/mesa_shader_cache"
+        "$HOME/.cache/node-gyp" "$HOME/.cache/ms-playwright" "$HOME/.cache/huggingface"
+    )
+    for c in "${extras[@]}"; do antes=$(( antes + $(tamano_de "$c") )); done
+    if (( antes > 0 )) && confirmar "→ ¿Eliminar cachés de runtime bajo riesgo ($(formatear_bytes "$antes"))?"; then
+        for c in "${extras[@]}"; do rm -rf "$c" 2>/dev/null; done
+        echo -e "   ${GREEN}✔ Cachés de runtime eliminados ($(formatear_bytes "$antes"))${RESET}"
+    fi
+
+    if command -v pacman >/dev/null 2>&1 && confirmar "→ ¿Limpiar también los paquetes de la caché ya desinstalados (paccache -ruk0)?"; then
+        if command -v paccache >/dev/null 2>&1; then
+            sudo paccache -ruk0 2>/dev/null
+            echo -e "   ${GREEN}✔ Caché de paquetes desinstalados purgada${RESET}"
+        else
+            echo -e "   ${YELLOW}⚠ paccache no está instalado (pacman-contrib).${RESET}"
+        fi
+    fi
+
+    echo ""
+    echo -e "${GREEN}✔ Limpieza profunda finalizada${RESET}"
+    registrar_ultima_accion "Limpieza profunda"
+    pause
+}
+
 # ═══════════════════════════════════════════════════════
 #  MENÚ PRINCIPAL
 # ═══════════════════════════════════════════════════════
@@ -1970,10 +2560,11 @@ ${CYAN}${BOLD} ──── MONITORIZACIÓN ────────────
 ${CYAN}${BOLD} ──── EXTRAS ──────────────────────────────────────────${RESET}"
         echo -e "${CYAN}14)${RESET} Cachés de aplicaciones                             ${CYAN}15)${RESET} Refrescar repositorios"
         echo -e "${CYAN}16)${RESET} Limpiar kernels antiguos                           ${CYAN}17)${RESET} Revisar .pacnew/.pacsave"
-        echo -e "${CYAN}18)${RESET} Diagnóstico de red y DNS
+        echo -e "${CYAN}18)${RESET} Diagnóstico de red y DNS                          ${CYAN}21)${RESET} Optimizar red (BBR)
 "
         echo -e "${CYAN}${BOLD} ──── KYRO ───────────────────────────────────────────────${RESET}"
         echo -e "${CYAN}19)${RESET} Actualizaciones (auto)                             ${CYAN}20)${RESET} Ver README"
+        echo -e "${CYAN}22)${RESET} Chequeo de salud completo                          ${CYAN}23)${RESET} Limpieza profunda"
 
         echo -e "${CYAN} ───────────────────────────────────────────────────────────${RESET}"
         echo -e "${CYAN} S)${RESET} Resumen del sistema                    ${RED}0)${RESET} Salir"
@@ -2002,6 +2593,9 @@ ${CYAN}${BOLD} ──── EXTRAS ───────────────
             18) diagnostico_red ;;
             19) actualizaciones_auto ;;
             20) abrir_readme ;;
+            21) optimizar_red ;;
+            22) chequeo_salud ;;
+            23) limpieza_profunda ;;
             [Ss]) system_box ;;
             0|q|Q) exit 0 ;;
             *) echo -e "${RED}Opción inválida${RESET}"; sleep 1 ;;
