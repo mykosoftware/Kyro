@@ -3,11 +3,11 @@
 # ═══════════════════════════════════════════════════════
 #  Kyro Optimizer – Mantenimiento y diagnóstico del sistema
 #  Licencia: GPL-3.0
-#  Versión: 4
+#  Versión: 4.1
 # ═══════════════════════════════════════════════════════
 
 set -uo pipefail
-VERSION="4"
+VERSION="4.1"
 
 # ─── Colores ───────────────────────────────────────────
 CYAN="\e[36m"
@@ -250,14 +250,24 @@ calcular_cpu_pct() {
 # ─── Cabecera ─────────────────────────────────────────
 header() {
     clear
+    local GREEN="\e[1;32m" GRAY="\e[0;37m"
+    echo ""
+
+    # Arte ASCII: Taza en primer plano intercalada con KY y RO al fondo
+    echo -e "${GREEN}  █   █  █   █${RESET}"
+    echo -e "${GREEN}  █  █    █ █   ${GRAY}   (  (   ${RESET}"
+    echo -e "${GREEN}  ███      █    ${GRAY}    )  )  ${RESET}"
+    echo -e "${GREEN}  █  █     █    ${GRAY} .------------.  ${RESET}"
+    echo -e "${GREEN}  █   █    █    ${GRAY}/              \____ ${RESET}"
+    echo -e "${GREEN}               ${GRAY}|   .--------.   |   \ ${RESET}"
+    echo -e "${GREEN}  ████   ████  ${GRAY}|  |          |  |    |${RESET}"
+    echo -e "${GREEN}  █   █  █  █  ${GRAY}|  |          |  |___/ ${RESET}"
+    echo -e "${GREEN}  ████   █  █  ${GRAY} \  \        /  /      ${RESET}"
+    echo -e "${GREEN}  █  █   █  █  ${GRAY}  '------------'       ${RESET}"
+    echo -e "${GREEN}  █   █  ████  ${GRAY}.----------------.     ${RESET}"
+    echo -e "               ${GRAY}(__________________)    ${RESET}"
+
     echo -e "${CYAN}
-██╗  ██╗██╗   ██╗██████╗  ██████╗
-██║ ██╔╝╚██╗ ██╔╝██╔══██╗██╔═══██╗
-█████╔╝  ╚████╔╝ ██████╔╝██║   ██║
-██╔═██╗   ╚██╔╝  ██╔══██╗██║   ██║
-██║  ██╗   ██║   ██║  ██║╚██████╔╝
-╚═╝  ╚═╝   ╚═╝   ╚═╝  ╚═╝ ╚═════╝
-${RESET}${CYAN}
         Kyro Optimizer v${VERSION}
         GPL-3.0 | Linux
 ${RESET}"
