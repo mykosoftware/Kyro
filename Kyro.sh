@@ -3,11 +3,11 @@
 # ═══════════════════════════════════════════════════════
 #  Kyro Optimizer – Mantenimiento y diagnóstico del sistema
 #  Licencia: GPL-3.0
-#  Versión: 3.2
+#  Versión: 3.21
 # ═══════════════════════════════════════════════════════
 
 set -uo pipefail
-VERSION="3.2"
+VERSION="3.21"
 
 # ─── Colores ───────────────────────────────────────────
 CYAN="\e[36m"
