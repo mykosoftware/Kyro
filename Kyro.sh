@@ -3,11 +3,11 @@
 # ═══════════════════════════════════════════════════════
 #  Kyro Optimizer – Mantenimiento y diagnóstico del sistema
 #  Licencia: GPL-3.0
-#  Versión: 3.3
+#  Versión: 4
 # ═══════════════════════════════════════════════════════
 
 set -uo pipefail
-VERSION="3.3"
+VERSION="4"
 
 # ─── Colores ───────────────────────────────────────────
 CYAN="\e[36m"
@@ -47,6 +47,52 @@ confirmar() {
     local respuesta
     read -rp "$pregunta [y/N] " respuesta || respuesta="n"
     [[ "${respuesta,,}" == "y" ]]
+}
+
+# ─── Rutas protegidas: jamás se eliminan ───────────────
+# Wine, Proton y herramientas de compatibilidad (prefijos, prefixs de
+# Steam/Lutris/Heroic/Bottles, etc.). La limpieza y el borrado por
+# selección comprueban siempre esta lista antes de tocar algo.
+PROTEGER_RUTAS=(
+    "$HOME/.wine"
+    "$HOME/.local/share/wineprefixes"
+    "$HOME/.local/share/prefixes"
+    "$HOME/.local/share/lutris"
+    "$HOME/.local/share/heroic"
+    "$HOME/.local/share/bottles"
+    "$HOME/.local/share/Steam/steamapps/compatdata"
+    "$HOME/.local/share/steam/steamapps/compatdata"
+    "$HOME/.local/share/Steam/steamapps/common/Proton*"
+    "$HOME/.local/share/steam/steamapps/common/Proton*"
+    "$HOME/.var/app/net.lutris.Lutris"
+    "$HOME/.var/app/com.usebottles.bottles"
+    "$HOME/.var/app/com.valvesoftware.Steam"
+    "$HOME/.var/app/com.heroicgameslauncher.hgl"
+    "$HOME/GameHub"
+)
+
+# ¿Está la ruta (o algo dentro de ella) bajo una ruta protegida?
+# Uso: if ruta_protegida "$dir"; then ... no tocar ...; fi
+ruta_protegida() {
+    local r="$1" p pp rp m mm
+    rp=$(readlink -f "$r" 2>/dev/null || echo "$r")
+    for p in "${PROTEGER_RUTAS[@]}"; do
+        [[ -n "$p" ]] || continue
+        if [[ "$p" == *[\*\?\[]* ]]; then
+            # Patrón con comodín (p. ej. ".../common/Proton*")
+            for m in $p; do
+                [[ -e "$m" ]] || continue
+                mm=$(readlink -f "$m" 2>/dev/null || echo "$m")
+                [[ "$rp" == "$mm" ]] && return 0
+                [[ "$rp" == "$mm"/* ]] && return 0
+            done
+        else
+            pp=$(readlink -f "$p" 2>/dev/null || echo "$p")
+            [[ "$rp" == "$pp" ]] && return 0
+            [[ "$rp" == "$pp"/* ]] && return 0
+        fi
+    done
+    return 1
 }
 
 tamano_de() {
@@ -251,6 +297,21 @@ detectar_pkg_manager() {
     else
         echo "desconocido"
     fi
+}
+
+# ─── Detección de GPU (para gaming) ───────────────────
+detectar_gpu_modelo() {
+    command -v lspci >/dev/null 2>&1 || { echo ""; return; }
+    lspci 2>/dev/null | grep -iE 'VGA compatible controller|3D controller' | head -1 | sed 's/^[0-9a-f:. ]*//'
+}
+
+detectar_gpu_vendor() {
+    local linea
+    linea=$(detectar_gpu_modelo)
+    if echo "$linea" | grep -qi 'nvidia'; then echo "nvidia"
+    elif echo "$linea" | grep -qiE 'amd|ati|radeon'; then echo "amd"
+    elif echo "$linea" | grep -qi 'intel'; then echo "intel"
+    else echo "desconocido"; fi
 }
 
 # ─── Resumen del sistema (ventanita) ──────────────────
@@ -538,13 +599,27 @@ directorios_vacios() {
     local tmpfile
     tmpfile=$(mktemp)
     spinner "Buscando directorios vacíos" bash -c "find \"$HOME\" -maxdepth 5 -type d -empty 2>/dev/null > \"$tmpfile\""
+    # Nunca se tocarán directorios de Wine/Proton ni herramientas de compatibilidad.
+    local protegidos
+    protegidos=0
+    while IFS= read -r dir; do
+        if ruta_protegida "$dir"; then
+            protegidos=$((protegidos + 1))
+        fi
+    done < "$tmpfile"
     local total
     total=$(wc -l < "$tmpfile")
 
     if [[ "$total" -eq 0 ]]; then
         echo -e "       ${GREEN}✔ No se encontraron directorios vacíos${RESET}"
+        if (( protegidos > 0 )); then
+            echo -e "       ${YELLOW}⚠ Se omitieron ${protegidos} directorio(s) protegido(s) (Wine/Proton).${RESET}"
+        fi
     else
         printf "       ${YELLOW}📁 Directorios vacíos: %3d${RESET}\n" "$total"
+        if (( protegidos > 0 )); then
+            echo -e "       ${DIM}      (${protegidos} directorio(s) de compatibilidad protegido(s) y omitido(s))${RESET}"
+        fi
         printf "       ${YELLOW}   (mostrando primeros 5)${RESET}\n"
         head -5 "$tmpfile" | while IFS= read -r dir; do
             local short
@@ -562,11 +637,17 @@ directorios_vacios() {
             progress_bar "Eliminando directorios vacíos" 1.5
             local eliminados=0
             while IFS= read -r dir; do
+                if ruta_protegida "$dir"; then
+                    continue
+                fi
                 if rmdir "$dir" 2>/dev/null; then
                     eliminados=$((eliminados + 1))
                 fi
             done < "$tmpfile"
             echo -e "${GREEN}✔ Se eliminaron ${eliminados} de ${total} directorios vacíos${RESET}"
+            if (( protegidos > 0 )); then
+                echo -e "${YELLOW}   ${protegidos} directorio(s) de Wine/Proton protegido(s).${RESET}"
+            fi
             registrar_ultima_accion "Directorios vacíos eliminados (${eliminados})"
         else
             echo -e "${YELLOW}No se eliminó ningún directorio.${RESET}"
@@ -736,18 +817,21 @@ optimizar_hardware() {
     echo -e "${CYAN}│${RESET} Analizando CPU, RAM, almacenamiento, swap y salud...${CYAN}"
     echo -e "${CYAN}╰──────────────────────────────────────────────────────────────────╯${RESET}"
 
-    # ── Perfil de uso: rendimiento vs estabilidad ──
+    # ── Perfil de uso: 4 perfiles con recomendaciones más precisas ──
     echo ""
     echo -e "${BOLD}¿Qué perfil prefieres para las recomendaciones?${RESET}"
-    echo -e "${CYAN}  1)${RESET} ${BOLD}Máximo rendimiento${RESET}  ${DIM}(más swap, mejor latencia)${RESET}"
-    echo -e "${CYAN}  2)${RESET} ${BOLD}Máxima estabilidad${RESET}    ${DIM}(swap justo, más conservador)${RESET}"
+    echo -e "${CYAN}  1)${RESET} ${BOLD}Máximo rendimiento${RESET}  ${DIM}(menor swappiness, más caché en RAM)${RESET}"
+    echo -e "${CYAN}  2)${RESET} ${BOLD}Equilibrado (recomendado)${RESET} ${DIM}(buen rendimiento sin sacrificar estabilidad)${RESET}"
+    echo -e "${CYAN}  3)${RESET} ${BOLD}Máxima estabilidad${RESET}    ${DIM}(menos riesgo, ajustes conservadores)${RESET}"
+    echo -e "${CYAN}  4)${RESET} ${BOLD}Gaming (rendimiento puro)${RESET} ${DIM}(swap generoso, latencia mínima)${RESET}"
     local perfil
-    read -rp "Elige [1/2] (por defecto: 1): " perfil || perfil="1"
-    if [[ "$perfil" == "2" ]]; then
-        perfil="estabilidad"
-    else
-        perfil="rendimiento"
-    fi
+    read -rp "Elige [1/2/3/4] (por defecto: 2): " perfil || perfil="2"
+    case "$perfil" in
+        1) perfil="rendimiento" ;;
+        3) perfil="estabilidad" ;;
+        4) perfil="gaming" ;;
+        *) perfil="equilibrado" ;;
+    esac
     echo ""
 
     # ── Detección de disco (multiplataforma) ──
@@ -815,54 +899,99 @@ optimizar_hardware() {
     fi
 
     # ── Cálculo de recomendaciones ──
-    # swap base: rendimiento busca que todo quepa (swap = RAM para ≤16G);
-    # estabilidad usa la mitad (menos swap roto a disco).
-    local swap_rec swappiness_rec governor_rec sched_rec
-    if (( ram_mb <= 2048 )); then
-        swap_rec=$((ram_mb * 2))
+    # swap base por perfil:
+    #   rendimiento: todo quepa (swap ≈ RAM hasta 16G)
+    #   equilibrado/estabilidad: mitad de la RAM (≤ 16G)
+    #   gaming: swap generoso — 12-14G en equipos de 8-16G (juegos pesados).
+    local swap_rec swappiness_rec vcp_rec dirtybg_rec dirty_rec comp_rec pagecluster_rec max_map_rec
+    local es_ssd=0
+    [[ "$tipo_disco" == "SSD"* ]] && es_ssd=1
+
+    if (( ram_mb <= 2048 )); then swap_rec=$((ram_mb * 2))
+    elif (( ram_mb <= 4096 )); then
+        [[ "$perfil" == "gaming" ]] && swap_rec=$((ram_mb * 2)) || swap_rec=$ram_mb
     elif (( ram_mb <= 8192 )); then
-        swap_rec=$ram_mb
+        if [[ "$perfil" == "gaming" ]]; then swap_rec=14336
+        elif [[ "$perfil" == "rendimiento" ]]; then swap_rec=$ram_mb
+        else swap_rec=$((ram_mb / 2)); fi
     elif (( ram_mb <= 16384 )); then
-        if [[ "$perfil" == "rendimiento" ]]; then
-            swap_rec=$ram_mb
-        else
-            swap_rec=$((ram_mb / 2))
-        fi
+        if [[ "$perfil" == "gaming" ]]; then swap_rec=12288
+        elif [[ "$perfil" == "rendimiento" ]]; then swap_rec=$ram_mb
+        else swap_rec=$((ram_mb / 2)); fi
     else
-        swap_rec=4096
+        [[ "$perfil" == "gaming" ]] && swap_rec=8192 || swap_rec=4096
     fi
-    # Si existe zram, ya hay swap comprimida y rápida.
-    if (( swap_zram == 1 )); then
-        swap_rec=$((swap_rec / 2))
-        (( swap_rec < 512 )) && swap_rec=512
+    # Con zram activa solo se reduce el swap a disco salvo en gaming
+    # (los juegos pesados necesitan ese margen extra).
+    if (( swap_zram == 1 )) && [[ "$perfil" != "gaming" ]]; then
+        swap_rec=$((swap_rec / 2)); (( swap_rec < 512 )) && swap_rec=512
     fi
 
-    if [[ "$perfil" == "estabilidad" ]]; then
-        # conservador: suficiente para no OOM, sin gastar disco de sobra
-        if (( ram_mb >= 16384 )); then
-            swappiness_rec=10
-        elif (( ram_mb >= 8192 )); then
-            swappiness_rec=20
-        else
-            swappiness_rec=30
-        fi
-    else
-        # rendimiento: mantiene apps en RAM lo más posible
-        if (( ram_mb >= 16384 )); then
-            swappiness_rec=5
-        elif (( ram_mb >= 8192 )); then
-            swappiness_rec=10
-        else
-            swappiness_rec=15
-        fi
-    fi
+    # vm.swappiness según perfil, RAM y tipo de disco (HDD usa más swap).
+    case "$perfil" in
+        rendimiento)
+            (( ram_mb >= 16384 )) && swappiness_rec=5
+            (( ram_mb >= 8192 && ram_mb < 16384 )) && swappiness_rec=10
+            (( ram_mb < 8192 )) && swappiness_rec=15
+            ;;
+        gaming)
+            # rendimiento puro: apps y juegos permanecen en RAM.
+            (( ram_mb >= 8192 )) && swappiness_rec=5
+            (( ram_mb < 8192 )) && swappiness_rec=10
+            ;;
+        estabilidad)
+            (( ram_mb >= 16384 )) && swappiness_rec=15
+            (( ram_mb >= 8192 && ram_mb < 16384 )) && swappiness_rec=25
+            (( ram_mb < 8192 )) && swappiness_rec=35
+            ;;
+        *)  # equilibrado
+            (( ram_mb >= 16384 )) && swappiness_rec=10
+            (( ram_mb >= 8192 && ram_mb < 16384 )) && swappiness_rec=20
+            (( ram_mb < 8192 )) && swappiness_rec=30
+            ;;
+    esac
     [[ "$tipo_disco" == "HDD" ]] && swappiness_rec=$((swappiness_rec + 20))
     (( swappiness_rec > 60 )) && swappiness_rec=60
     (( swap_zram == 1 )) && swappiness_rec=100
 
+    # Caché de inodos/entradas (más baja = se conserva más en RAM).
+    case "$perfil" in
+        rendimiento) vcp_rec=50 ;;
+        gaming)      vcp_rec=25 ;;
+        *)           vcp_rec=100 ;;
+    esac
+
+    # Escrituras diferidas (porcentaje de RAM antes de volcar a disco).
+    case "$perfil" in
+        rendimiento|gaming)
+            if (( es_ssd == 1 )); then dirtybg_rec=3; dirty_rec=10; else dirtybg_rec=5; dirty_rec=15; fi ;;
+        estabilidad) dirtybg_rec=10; dirty_rec=20 ;;
+        *)           dirtybg_rec=5;  dirty_rec=15 ;;
+    esac
+
+    # Proactividad de compactación (menor = menos ciclos de CPU en RAM).
+    case "$perfil" in
+        rendimiento|gaming) comp_rec=0 ;;
+        estabilidad) comp_rec=20 ;;
+        *)           comp_rec=10 ;;
+    esac
+
+    # Page-cluster: 0 en SSD (menos lecturas de página en swap), 3 en HDD.
+    if (( es_ssd == 1 )); then pagecluster_rec=0; else pagecluster_rec=3; fi
+
+    # límite de mapas de memoria: los juegos (Vulkan/Proton) piden más de 1M;
+    # el valor alto evita "out of memory: kill process" en cargas pesadas.
+    if [[ "$perfil" == "gaming" ]]; then max_map_rec=2147483642
+    elif [[ "$perfil" == "rendimiento" ]]; then max_map_rec=1048576
+    else max_map_rec=0; fi
+
     local governor_rec
-    if [[ "$perfil" == "estabilidad" ]]; then
+    if [[ "$perfil" == "gaming" ]]; then
+        governor_rec="performance"
+    elif [[ "$perfil" == "estabilidad" ]]; then
         governor_rec="powersave"
+    elif [[ "$perfil" == "equilibrado" ]]; then
+        if [[ "$es_laptop" == "Sí" ]]; then governor_rec="powersave"; else governor_rec="ondemand"; fi
     elif [[ "$es_laptop" == "Sí" ]]; then
         governor_rec="powersave"
     else
@@ -871,7 +1000,9 @@ optimizar_hardware() {
     # Ajusta según disponibilidad real
     if [[ -n "$gobernadores" ]]; then
         if ! echo "$gobernadores" | tr ' ' '\n' | grep -qx "$governor_rec"; then
-            governor_rec=$(echo "$gobernadores" | awk '{print $1}')
+            # Elige el más próximo disponible (prefiere ondemand/performance)
+            governor_rec=$(echo "$gobernadores" | tr ' ' '\n' | grep -E '^(performance|ondemand|schedutil|powersave)$' | head -1)
+            [[ -z "$governor_rec" ]] && governor_rec=$(echo "$gobernadores" | awk '{print $1}')
         fi
     fi
 
@@ -892,8 +1023,11 @@ optimizar_hardware() {
     # ── Mostrar detección ──
     echo ""
     echo -e "${CYAN}${BOLD}╭─ Hardware detectado ────────────────────────────────────────────╮${RESET}"
+    local gpu_model
+    gpu_model=$(detectar_gpu_modelo)
     echo -e "${CYAN}│${RESET} CPU:                        ${cpu_model} (${nucleos} núcleos)"
     echo -e "${CYAN}│${RESET} RAM:                        ${ram_gb} GiB (${ram_mb} MB)"
+    [[ -n "$gpu_model" ]] && echo -e "${CYAN}│${RESET} GPU:                        ${gpu_model}"
     echo -e "${CYAN}│${RESET} Disco (/):                  /dev/${base_dev}  ->  ${tipo_disco}"
     echo -e "${CYAN}│${RESET} Portátil (batería):         ${es_laptop}"
     echo -e "${CYAN}│${RESET} Gobernador actual:          ${governor_actual}"
@@ -916,28 +1050,57 @@ optimizar_hardware() {
 
     echo ""
     echo -e "${CYAN}${BOLD}╭─ Recomendaciones (perfil: ${BOLD}${perfil}${RESET}${CYAN}) ───────────────────────╮${RESET}"
-    echo -e "${CYAN}│${RESET} Swap recomendado:              ${swap_rec} MB  (actual: ${swap_total} MB)"
-    echo -e "${CYAN}│${RESET} vm.swappiness recomendado:     ${swappiness_rec}"
-    echo -e "${CYAN}│${RESET} Gobernador de CPU recomendado: ${governor_rec}"
-    echo -e "${CYAN}│${RESET} Planificador E/S recomendado:  ${sched_rec}"
+    echo -e "${CYAN}│${RESET} Swap recomendado:              ${swap_rec} MB   (actual: ${swap_total} MB)"
+    echo -e "${CYAN}│${RESET} vm.swappiness:                 ${swappiness_rec}"
+    echo -e "${CYAN}│${RESET} vm.vfs_cache_pressure:         ${vcp_rec}"
+    echo -e "${CYAN}│${RESET} dirty_ratio / background:      ${dirty_rec} / ${dirtybg_rec}"
+    echo -e "${CYAN}│${RESET} vm.compaction_proactiveness:   ${comp_rec}"
+    echo -e "${CYAN}│${RESET} vm.page-cluster:               ${pagecluster_rec}"
+    if (( max_map_rec > 0 )); then
+        echo -e "${CYAN}│${RESET} vm.max_map_count:              ${max_map_rec}"
+    fi
+    echo -e "${CYAN}│${RESET} Gobernador de CPU:             ${governor_rec}"
+    echo -e "${CYAN}│${RESET} Planificador E/S:              ${sched_rec}"
     echo -e "${CYAN}╰──────────────────────────────────────────────────────────────────╯${RESET}"
     echo ""
 
     if ! confirmar "¿Deseas aplicar ahora los ajustes recomendados (se te preguntará uno por uno)?"; then
         echo -e "${YELLOW}No se aplicó ningún cambio.${RESET}"
-        registrar_ultima_accion "Análisis de hardware (${tipo_disco}, ${ram_gb}GiB RAM)"
+        registrar_ultima_accion "Análisis de hardware (${tipo_disco}, ${ram_gb}GiB RAM, perfil ${perfil})"
         pause
         return
     fi
 
-    # ── Aplicar swappiness ──
-    if confirmar "  → ¿Aplicar vm.swappiness=${swappiness_rec}?"; then
-        if sudo sysctl -w vm.swappiness="$swappiness_rec" >/dev/null 2>&1; then
-            echo "vm.swappiness=${swappiness_rec}" | sudo tee /etc/sysctl.d/99-kyro-optimizer.conf >/dev/null 2>&1 || true
-            echo -e "${GREEN}✔ swappiness aplicado y guardado de forma persistente${RESET}"
-        else
-            echo -e "${RED}✘ No se pudo aplicar swappiness (¿tienes permisos sudo?)${RESET}"
+    # Aplicador interno: aplica el sysctl y guarda el par para persistir.
+    local ajustes=()
+    local clave_valor
+    aplicar_hw_sysctl() {
+        local cv="$1" sum=""
+        if sudo sysctl -w "$cv" >/dev/null 2>&1; then
+            ajustes+=("$cv")
+            echo -e "   ${GREEN}✔${RESET} $cv"
+            return 0
         fi
+        echo -e "   ${YELLOW}⚠${RESET} $cv (no aplicable)"
+        return 1
+    }
+
+    # ── Aplicar sysctls de memoria virtual ──
+    echo ""
+    echo -e "${BOLD}▸ Memoria virtual:${RESET}"
+    if confirmar "  → ¿Aplicar vm.swappiness=${swappiness_rec}?"; then aplicar_hw_sysctl "vm.swappiness=$swappiness_rec"; fi
+    if confirmar "  → ¿Aplicar vm.vfs_cache_pressure=${vcp_rec}?"; then aplicar_hw_sysctl "vm.vfs_cache_pressure=$vcp_rec"; fi
+    if confirmar "  → ¿Aplicar dirty_ratio=${dirty_rec} / background=${dirtybg_rec}?"; then
+        aplicar_hw_sysctl "vm.dirty_ratio=$dirty_rec"
+        aplicar_hw_sysctl "vm.dirty_background_ratio=$dirtybg_rec"
+    fi
+    if confirmar "  → ¿Aplicar vm.compaction_proactiveness=${comp_rec}?"; then aplicar_hw_sysctl "vm.compaction_proactiveness=$comp_rec"; fi
+    if confirmar "  → ¿Aplicar vm.page-cluster=${pagecluster_rec}?"; then aplicar_hw_sysctl "vm.page-cluster=$pagecluster_rec"; fi
+    if (( max_map_rec > 0 )); then
+        if confirmar "  → ¿Aplicar vm.max_map_count=${max_map_rec} (requerido por juegos)?"; then aplicar_hw_sysctl "vm.max_map_count=$max_map_rec"; fi
+    fi
+    if (( ${#ajustes[@]} > 0 )); then
+        guardar_sysctls "99-kyro-optimizer.conf" "${ajustes[@]}"
     fi
 
     # ── Aplicar gobernador de CPU ──
@@ -954,7 +1117,7 @@ optimizar_hardware() {
                 echo -e "${YELLOW}⚠ No se pudo aplicar en todos los núcleos${RESET}"
             fi
             if confirmar "    → ¿Persistir tras reiniciar con un servicio systemd?"; then
-                persistir_optimizacion "$governor_rec" "$sched_rec" "$swappiness_rec" "$base_dev"
+                persistir_optimizacion "$governor_rec" "$sched_rec" "$base_dev"
             fi
         fi
     else
@@ -984,13 +1147,13 @@ optimizar_hardware() {
         echo -e "${GREEN}✔ Tu swap actual ya es adecuado para tu RAM${RESET}"
     fi
 
-    registrar_ultima_accion "Optimización de hardware (${tipo_disco}, ${ram_gb} GiB RAM)"
+    registrar_ultima_accion "Optimización de hardware (${tipo_disco}, ${ram_gb} GiB RAM, perfil ${perfil})"
     pause
 }
 
-# Persistencia con systemd.
+# Persistencia con systemd (gobernador + planificador; lo demás va en sysctl.d).
 persistir_optimizacion() {
-    local gov="$1" sched="$2" swappiness="$3" dev="$4"
+    local gov="$1" sched="$2" dev="$3"
     local bin="/usr/local/bin/kyro-perf-apply.sh"
     local svc="/etc/systemd/system/kyro-perf.service"
     echo -e "${DIM}Creando servicio persistente kyro-perf.service...${RESET}"
@@ -1000,7 +1163,6 @@ for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
     [ -w "\$g" ] && echo "$gov" > "\$g" 2>/dev/null
 done
 echo "$sched" > /sys/block/$dev/queue/scheduler 2>/dev/null || true
-echo "$swappiness" > /proc/sys/vm/swappiness
 EOF
         then :; else
         echo -e "${RED}No se pudo escribir el script persistente.${RESET}"
@@ -1926,23 +2088,119 @@ reparar_paquetes_danados() {
     fi
 }
 
-# ─── Buscar archivos grandes (> 1 GB) ──────────────────
-archivos_grandes() {
-    echo -e "${YELLOW}Archivos mayores a 1 GB en tu HOME:${RESET}"
-    local tmpfile
-    tmpfile=$(mktemp)
-    spinner "Buscando archivos grandes" bash -c \
-        "find \"$HOME\" -maxdepth 6 -type f -size +1G -exec du -h {} \; 2>/dev/null | sort -rh > \"$tmpfile\""
-    if [[ -s "$tmpfile" ]]; then
-        head -20 "$tmpfile"
-        local total
-        total=$(wc -l < "$tmpfile")
-        echo -e "${DIM}Mostrando hasta 20 de ${total} archivo(s) encontrados.${RESET}"
-        registrar_ultima_accion "Búsqueda de archivos grandes (${total} encontrados)"
-    else
-        echo -e "${GREEN}✔ No se encontraron archivos mayores a 1 GB${RESET}"
+# ─── Buscar archivos grandes (> 1 GB) y liberar espacio ──
+# Envía a la papelera (o borra, si se confirma) los archivos y carpetas
+# elegidos, sin tocar jamás las rutas protegidas (Wine/Proton, etc.).
+mover_a_papelera() {
+    local ruta="$1" files destino base i=1
+    if command -v gio >/dev/null 2>&1; then
+        if gio trash "$ruta" 2>/dev/null; then
+            return 0
+        fi
     fi
-    rm -f "$tmpfile"
+    files="$HOME/.local/share/Trash/files"
+    mkdir -p "$files" 2>/dev/null || return 1
+    base=$(basename "$ruta")
+    destino="$files/$base"
+    while [[ -e "$destino" ]]; do
+        destino="$files/${base}_${i}"
+        i=$((i + 1))
+    done
+    if mv -f "$ruta" "$destino" 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+archivos_grandes() {
+    clear
+    echo -e "${CYAN}${BOLD}╭─ Archivos y carpetas grandes (>1 GB) ────────────────────────────╮${RESET}"
+    echo -e "${CYAN}│${RESET} Puedes enviar a la papelera lo que ya no uses.${CYAN}"
+    echo -e "${CYAN}╰──────────────────────────────────────────────────────────────────╯${RESET}"
+    echo ""
+
+    local tmp ddir rutas=() n=0 sel
+    tmp=$(mktemp)
+    ddir=$(mktemp)
+
+    # 1) Archivos > 1 GB (con tamaño en bytes), excluye la papelera.
+    spinner "Buscando archivos > 1 GB" bash -c \
+        "find \"$HOME\" -maxdepth 6 -type f -size +1G \
+           -not -path '*/Trash/*' -not -path '*/.local/share/Trash/*' \
+           -exec stat -c '%s %n' {} \; 2>/dev/null > \"$tmp\""
+
+    # 2) Carpetas de gran tamaño (hasta profundidad 3), excl. papelera y protegidas.
+    local dir bytes
+    while IFS= read -r dir; do
+        [[ -n "$dir" ]] || continue
+        case "$dir" in
+            "$HOME"|"$HOME/."*|*/Trash*/) continue ;;
+        esac
+        ruta_protegida "$dir" && continue
+        bytes=$(du -sb "$dir" 2>/dev/null | awk '{print $1}')
+        if [[ -n "$bytes" ]] && (( bytes > 1073741824 )); then
+            echo "$bytes $dir" >> "$ddir"
+        fi
+    done < <(find "$HOME" -maxdepth 2 -mindepth 1 -type d 2>/dev/null | sort)
+    sort -k1,1nr "$ddir" | head -20 >> "$tmp"
+    sort -k1,1nr "$tmp" -o "$tmp"
+
+    if [[ ! -s "$tmp" ]]; then
+        echo -e "${GREEN}✔ No se encontraron archivos ni carpetas mayores a 1 GB${RESET}"
+        rm -f "$tmp" "$ddir"
+        pause
+        return
+    fi
+
+    local line ruta tipo protegida
+    while IFS= read -r line; do
+        read -r bytes ruta <<< "$line"
+        [[ -n "$ruta" ]] || continue
+        protegida=""
+        ruta_protegida "$ruta" && protegida="${YELLOW} [protegido]${RESET}"
+        if [[ -d "$ruta" ]]; then tipo="carpeta"; else tipo="archivo"; fi
+        n=$((n + 1))
+        rutas+=("$ruta")
+        printf "  ${CYAN}%2d)${RESET} ${DIM}%-8s${RESET} %9s  %s%s\n" \
+            "$n" "$tipo" "$(formatear_bytes "$bytes")" "$(truncate_path "$ruta")" "$protegida"
+    done < "$tmp"
+
+    echo ""
+    read -rp $'Números a ENVIAR A LA PAPELERA (p.ej. "1 4") o Enter para salir: ' sel || sel=""
+    if [[ -z "$sel" ]]; then
+        echo -e "${YELLOW}No se modificó nada.${RESET}"
+        rm -f "$tmp" "$ddir"
+        pause
+        return
+    fi
+
+    local idx
+    for idx in $sel; do
+        [[ "$idx" =~ ^[0-9]+$ ]] || { echo -e "${YELLOW}  '${idx}' no es un número válido.${RESET}"; continue; }
+        (( idx >= 1 && idx <= n )) || { echo -e "${YELLOW}  ${idx} fuera de rango.${RESET}"; continue; }
+        ruta=${rutas[$((idx - 1))]}
+        [[ -e "$ruta" ]] || { echo -e "${YELLOW}  Ya no existe: $(truncate_path "$ruta")${RESET}"; continue; }
+        if ruta_protegida "$ruta"; then
+            echo -e "${RED}✘ No se puede tocar (protegido): $(truncate_path "$ruta")${RESET}"
+            continue
+        fi
+        echo ""
+        echo -e "  ${BOLD}Seleccionado [${idx}]:${RESET} $(truncate_path "$ruta")"
+        if confirmar "  → ¿Enviar a la papelera?"; then
+            if mover_a_papelera "$ruta"; then
+                echo -e "  ${GREEN}✔ Enviado a la papelera: $(truncate_path "$ruta")${RESET}"
+            else
+                echo -e "  ${RED}✘ Falló al mover. ¿Borrar definitivamente?${RESET}"
+                if confirmar "    → ¿Borrar permanentemente $(truncate_path "$ruta")?"; then
+                    rm -rf "$ruta" 2>/dev/null && echo -e "  ${GREEN}✔ Eliminado definitivamente${RESET}" || echo -e "  ${RED}✘ No se pudo eliminar (permisos)${RESET}"
+                fi
+            fi
+        else
+            echo -e "  ${YELLOW}  Omitido.${RESET}"
+        fi
+    done
+    registrar_ultima_accion "Limpieza de archivos grandes (selección manual)"
+    rm -f "$tmp" "$ddir"
     pause
 }
 
@@ -2219,6 +2477,7 @@ Optimizador y herramienta de mantenimiento del sistema para Linux.
 - Limpia la caché en un solo toque: gestor oficial, AUR, navegadores, AppImage y sistema.
 - Optimiza hardware: CPU, RAM, swap, planificador de E/S y gobernador.
 - Optimización rápida persistente: sysctl, gobernador y planificadores en todos los discos.
+- Optimización gaming: GPU (AMD/NVIDIA/Intel), vm.max_map_count y CPU sin latencias.
 - Optimización de red: TCP BBR, colas fq y buffers (persistente).
 - Detecta y diagnostica errores de hardware (SMART, NVMe, ECC/MCE, temperatura).
 - Chequeo de salud completo con resumen ok/aviso/crítico.
@@ -2227,6 +2486,7 @@ Optimizador y herramienta de mantenimiento del sistema para Linux.
 - Repara servicios systemd fallidos (incluidos swaps rotos en btrfs).
 - Limpieza profunda opcional: coredumps, Snap/Flatpak/Docker/Podman.
 - Monitoriza CPU, RAM y temperatura en tiempo real.
+- Restaura por completo los ajustes de Kyro (rollback a valores de fábrica).
 - Se actualiza automáticamente a sí mismo (¡eso hace este mismo archivo!).
 
 ## Instalación
@@ -2531,6 +2791,234 @@ limpieza_profunda() {
     pause
 }
 
+# ─── 24) Optimización gaming (GPU + memoria + CPU) ─────
+# Ajustes específicos para jugar: freezes GPU de rendimiento,
+# vm.max_map_count alto (Proton/Vulkan), swappiness baja y
+# prioridad de tiempo real opcional. Todo reversible con la opción 25.
+optimizar_juegos() {
+    clear
+    echo -e "${CYAN}${BOLD}╭─ Optimización gaming ─────────────────────────────────────────────╮${RESET}"
+    echo -e "${CYAN}│${RESET} GPU en modo máximo, memoria para juegos y CPU sin latencias.${CYAN}"
+    echo -e "${CYAN}╰──────────────────────────────────────────────────────────────────╯${RESET}"
+    echo ""
+    echo -e "${DIM}   Se preguntará antes de aplicar cada ajuste. La opción 25 revierte todo.${RESET}"
+    echo ""
+    if ! confirmar "¿Deseas aplicar los ajustes gaming ahora?"; then
+        echo -e "${YELLOW}Cancelado.${RESET}"
+        return
+    fi
+    echo ""
+    KYRO_SYSCTL=()
+
+    local vendor modelo
+    vendor=$(detectar_gpu_vendor)
+    modelo=$(detectar_gpu_modelo)
+    echo -e "${BOLD}▸ GPU detectada:${RESET} ${vendor:-desconocida} ${DIM}(${modelo})${RESET}"
+    echo ""
+
+    # ── Memoria: juegos (Proton/Vulkan) piden > 1M mapas de memoria ──
+    echo -e "${BOLD}▸ Memoria virtual:${RESET}"
+    aplicar_sysctl "vm.max_map_count" "2147483642"
+    aplicar_sysctl "vm.swappiness" "5"
+    aplicar_sysctl "vm.vfs_cache_pressure" "25"
+    aplicar_sysctl "vm.compaction_proactiveness" "0"
+    echo ""
+    guardar_sysctls "99-kyro-gaming.conf" "${KYRO_SYSCTL[@]}"
+
+    # ── GPU en modo rendimiento ──
+    echo -e "${BOLD}▸ GPU (modo rendimiento):${RESET}"
+    case "$vendor" in
+        amd)
+            local dpm_levels=0 cfg
+            for dpm in /sys/class/drm/card*/device/power_dpm_force_performance_level; do
+                [[ -w "$dpm" ]] || continue
+                echo "performance" | sudo tee "$dpm" >/dev/null 2>&1 && dpm_levels=1
+            done
+            (( dpm_levels == 1 )) && echo -e "   ${GREEN}✔ power_dpm_force_performance_level=performance${RESET}" \
+                || echo -e "   ${YELLOW}⚠ sin control DPM de AMD accesible${RESET}"
+            # Perfiles de potencia de la VRM si el controlador los expone.
+            for cfg in /sys/class/drm/card*/device/power_pp_profile_mode; do
+                if [[ -w "$cfg" ]]; then
+                    echo "1" | sudo tee "$cfg" >/dev/null 2>&1 && echo -e "   ${GREEN}✔ power_pp_profile_mode=1 (máx. rendimiento)${RESET}"
+                fi
+            done
+            ;;
+        nvidia)
+            if command -v nvidia-smi >/dev/null 2>&1; then
+                sudo nvidia-smi -pm 1 >/dev/null 2>&1 && echo -e "   ${GREEN}✔ Persistence Mode activado (-pm 1)${RESET}" \
+                    || echo -e "   ${YELLOW}⚠ nvidia-smi no pudo activar persistence${RESET}"
+            else
+                echo -e "   ${YELLOW}⚠ nvidia-smi no instalado${RESET}"
+            fi
+            ;;
+        intel)
+            echo -e "   ${DIM}Intel integrada: sin perfil GPU manual (usa el gobernador de la bisagra).${RESET}"
+            ;;
+        *)
+            echo -e "   ${YELLOW}⚠ GPU no identificada; se omite el perfil de la GPU.${RESET}"
+            ;;
+    esac
+
+    if command -v gamemoderun >/dev/null 2>&1; then
+        echo -e "   ${GREEN}✔ Feral GameMode detectado: usa 'gamemoderun %command%' en Steam.${RESET}"
+    fi
+    echo ""
+
+    # ── CPU: gobernador de rendimiento ──
+    echo -e "${BOLD}▸ CPU:${RESET}"
+    local gov="performance" govok=0 avail=""
+    if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors ]]; then
+        avail=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors 2>/dev/null)
+        if ! echo "$avail" | tr ' ' '\n' | grep -qx "$gov"; then
+            gov=$(echo "$avail" | awk '{print $1}')
+        fi
+    fi
+    for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+        [[ -f "$g" ]] && echo "$gov" | sudo tee "$g" >/dev/null 2>&1 && govok=1
+    done
+    [[ "$govok" -eq 1 ]] && echo -e "   ${GREEN}✔ Gobernador CPU: ${gov}${RESET}" || echo -e "   ${YELLOW}⚠ sin cpufreq (se omite)${RESET}"
+
+    # kernel.game_mode (parche GameMode de Feral/CachyOS) si está expuesto.
+    if [[ -f /proc/sys/kernel/game_mode ]]; then
+        aplicar_sysctl "kernel.game_mode" "1"
+    fi
+
+    # Prioridad en tiempo real para audio/juegos (opcional y reversible).
+    if confirmar "  → ¿Habilitar tiempo real sin límite (kernel.sched_rt_runtime_us=-1)? (mejor latencia, uso experto)"; then
+        aplicar_sysctl "kernel.sched_rt_runtime_us" "-1"
+        guardar_sysctls "99-kyro-gaming.conf" "${KYRO_SYSCTL[@]}"
+    fi
+    echo ""
+
+    # ── Planificador de E/S en todos los discos (NVMe→none, SSD→mq-deadline) ──
+    echo -e "${BOLD}▸ Planificadores de E/S:${RESET}"
+    local q rec sched_ok=0
+    rec=$(cat "/sys/block/$(detectar_dispositivo_base)/queue/rotational" 2>/dev/null)
+    if [[ "$(detectar_dispositivo_base)" == nvme* ]]; then rec="none"
+    elif [[ "$rec" == "0" ]]; then rec="mq-deadline"
+    else rec="bfq"; fi
+    for q in /sys/block/*/queue/scheduler; do
+        [[ -f "$q" ]] || continue
+        if echo "$(cat "$q" 2>/dev/null)" | tr ' ' '\n' | sed 's/\[//;s/\]//' | grep -qx "$rec"; then
+            echo "$rec" | sudo tee "$q" >/dev/null 2>&1 && sched_ok=1
+        fi
+    done
+    [[ "$sched_ok" -eq 1 ]] && echo -e "   ${GREEN}✔ Scheduler: ${rec} en todos los discos${RESET}" || echo -e "   ${YELLOW}⚠ sin discos ajustables${RESET}"
+    echo ""
+
+    # ── Persistencia (script + servicio) ──
+    if confirmar "  → ¿Guardar GPU/CPU en un servicio para que apliquen en cada arranque?"; then
+        persistir_juegos "$gov" "$rec" "$vendor"
+    fi
+
+    registrar_ultima_accion "Optimización gaming (GPU=$vendor, gov=$gov)"
+    echo ""
+    echo -e "${GREEN}✔ Optimización gaming finalizada${RESET}"
+    pause
+}
+
+# Servicio systemd que reaplica GPU y gobernador en cada arranque (gaming).
+persistir_juegos() {
+    local gov="$1" sched="$2" vendor="$3"
+    local bin="/usr/local/bin/kyro-game-apply.sh"
+    local svc="/etc/systemd/system/kyro-game.service"
+    local tmpbin
+    tmpbin=$(mktemp)
+
+    cat > "$tmpbin" <<EOF
+#!/bin/bash
+# Generado por Kyro (optimización gaming). No editar a mano.
+for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+    [ -w "\$g" ] && echo "$gov" > "\$g" 2>/dev/null
+done
+for q in /sys/block/*/queue/scheduler; do
+    if grep -q "$sched" "\$q" 2>/dev/null; then
+        [ -w "\$q" ] && echo "$sched" > "\$q" 2>/dev/null
+    fi
+done
+case "$vendor" in
+    amd)
+        for d in /sys/class/drm/card*/device/power_dpm_force_performance_level; do
+            [ -w "\$d" ] && echo performance > "\$d" 2>/dev/null
+        done
+        ;;
+    nvidia)
+        command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -pm 1 >/dev/null 2>&1
+        ;;
+esac
+EOF
+    if sudo install -m 755 "$tmpbin" "$bin" >/dev/null 2>&1; then
+        sudo tee "$svc" >/dev/null <<EOF
+[Unit]
+Description=Ajustes gaming de Kyro
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=$bin
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        sudo systemctl daemon-reload >/dev/null 2>&1
+        if sudo systemctl enable --now kyro-game.service >/dev/null 2>&1; then
+            echo -e "   ${GREEN}✔ Servicio kyro-game activado (persistente)${RESET}"
+        else
+            echo -e "   ${YELLOW}⚠ Script guardado, pero no se pudo activar el servicio.${RESET}"
+        fi
+        rm -f "$tmpbin"
+        return 0
+    fi
+    rm -f "$tmpbin"
+    echo -e "   ${RED}✘ No se pudo escribir el script persistente (¿sudo?).${RESET}"
+    return 1
+}
+
+# ─── 25) Restaurar ajustes de Kyro (rollback) ─────────
+restaurar_optimizacion() {
+    clear
+    echo -e "${CYAN}${BOLD}╭─ Restaurar ajustes de Kyro ──────────────────────────────────────╮${RESET}"
+    echo -e "${CYAN}│${RESET} Elimina servicios y sysctl de Kyro y vuelve a los valores de fábrica.${CYAN}"
+    echo -e "${CYAN}╰──────────────────────────────────────────────────────────────────╯${RESET}"
+    echo ""
+    if ! confirmar "¿Deseas restaurar por completo los ajustes de Kyro?"; then
+        echo -e "${YELLOW}Cancelado.${RESET}"
+        return
+    fi
+    echo ""
+
+    # 1) Detiene y elimina los servicios de ajustes.
+    local svc
+    for svc in kyro-perf kyro-quick kyro-game; do
+        sudo systemctl stop "$svc.service" 2>/dev/null
+        sudo systemctl disable "$svc.service" 2>/dev/null
+        sudo rm -f "/etc/systemd/system/$svc.service" 2>/dev/null
+    done
+    sudo systemctl daemon-reload 2>/dev/null
+    echo -e "${GREEN}✔ Servicios de Kyro detenidos y eliminados${RESET}"
+
+    # 2) Borra los archivos sysctl de Kyro.
+    sudo rm -f /etc/sysctl.d/99-kyro-optimizer.conf /etc/sysctl.d/99-kyro-network.conf /etc/sysctl.d/99-kyro-gaming.conf 2>/dev/null
+    sudo rm -f /usr/local/bin/kyro-perf-apply.sh /usr/local/bin/kyro-quick-apply.sh /usr/local/bin/kyro-game-apply.sh 2>/dev/null
+    echo -e "${GREEN}✔ Configuración sysctl de Kyro eliminada${RESET}"
+
+    # 3) Restaura los valores por defecto del kernel (solo si están activos).
+    echo -e "${BOLD}▸ Restaurando valores por defecto del kernel:${RESET}"
+    local dflt="vm.swappiness=60 vm.vfs_cache_pressure=100 vm.dirty_ratio=20 vm.dirty_background_ratio=10 vm.page-cluster=3 vm.compaction_proactiveness=20 vm.max_map_count=65530"
+    local d
+    for d in $dflt; do
+        if sudo sysctl -w "$d" >/dev/null 2>&1; then
+            echo -e "   ${GREEN}✔${RESET} $d"
+        fi
+    done
+
+    echo ""
+    echo -e "${GREEN}✔ Ajustes de Kyro restaurados a los valores de fábrica${RESET}"
+    echo -e "${DIM}   (swap creado por Kyro no se elimina automáticamente)${RESET}"
+    registrar_ultima_accion "Restauración de ajustes de Kyro"
+    pause
+}
+
 # ═══════════════════════════════════════════════════════
 #  MENÚ PRINCIPAL
 # ═══════════════════════════════════════════════════════
@@ -2562,9 +3050,13 @@ ${CYAN}${BOLD} ──── EXTRAS ───────────────
         echo -e "${CYAN}16)${RESET} Limpiar kernels antiguos                           ${CYAN}17)${RESET} Revisar .pacnew/.pacsave"
         echo -e "${CYAN}18)${RESET} Diagnóstico de red y DNS                          ${CYAN}21)${RESET} Optimizar red (BBR)
 "
+        echo -e "${CYAN}${BOLD} ──── JUEGOS ─────────────────────────────────────────────${RESET}"
+        echo -e "${CYAN}24)${RESET} Optimización gaming (GPU/memoria/CPU)
+"
         echo -e "${CYAN}${BOLD} ──── KYRO ───────────────────────────────────────────────${RESET}"
         echo -e "${CYAN}19)${RESET} Actualizaciones (auto)                             ${CYAN}20)${RESET} Ver README"
         echo -e "${CYAN}22)${RESET} Chequeo de salud completo                          ${CYAN}23)${RESET} Limpieza profunda"
+        echo -e "${CYAN}25)${RESET} Restaurar ajustes de Kyro (rollback)"
 
         echo -e "${CYAN} ───────────────────────────────────────────────────────────${RESET}"
         echo -e "${CYAN} S)${RESET} Resumen del sistema                    ${RED}0)${RESET} Salir"
@@ -2596,6 +3088,8 @@ ${CYAN}${BOLD} ──── EXTRAS ───────────────
             21) optimizar_red ;;
             22) chequeo_salud ;;
             23) limpieza_profunda ;;
+            24) optimizar_juegos ;;
+            25) restaurar_optimizacion ;;
             [Ss]) system_box ;;
             0|q|Q) exit 0 ;;
             *) echo -e "${RED}Opción inválida${RESET}"; sleep 1 ;;
