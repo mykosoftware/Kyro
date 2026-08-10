@@ -3,11 +3,11 @@
 # ═══════════════════════════════════════════════════════
 #  Kyro Optimizer – Mantenimiento y diagnóstico del sistema
 #  Licencia: GPL-3.0
-#  Versión: 3.1
+#  Versión: 3.2
 # ═══════════════════════════════════════════════════════
 
 set -uo pipefail
-VERSION="3.1"
+VERSION="3.2"
 
 # ─── Colores ───────────────────────────────────────────
 CYAN="\e[36m"
@@ -21,6 +21,17 @@ DIM="\e[2m"
 RESET="\e[0m"
 
 STATE_FILE="$HOME/.cache/kyro_last_run"
+
+# ─── Rutas del script y actualizaciones ────────────────
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+README_PATH="$SCRIPT_DIR/README.md"
+
+UPDATE_AVAILABLE=""
+UPDATE_STATE_FILE="$HOME/.cache/kyro_update"
+
+# URL del script en el repositorio. Cámbiala si usas otro host/rama.
+UPDATE_URL="${UPDATE_URL:-https://raw.githubusercontent.com/mykosoftware/Kyro/main/Kyro.sh}"
 
 # ─── Utilidades ────────────────────────────────────────
 pause() {
@@ -207,6 +218,18 @@ ${RESET}"
             echo -e "${DIM}   Última acción: ${ultima/|/ - }${RESET}\n"
         fi
     fi
+    if [[ -n "$UPDATE_AVAILABLE" ]]; then
+        echo -e "${ORANGE}◈  ¡Nueva versión ${BOLD}${UPDATE_AVAILABLE}${RESET}${ORANGE} disponible!${RESET}"
+        echo -e "${ORANGE}    Opción 19 del menú para actualizar.${RESET}\n"
+    elif [[ -f "$UPDATE_STATE_FILE" ]]; then
+        local update_pendiente
+        update_pendiente=$(cat "$UPDATE_STATE_FILE" 2>/dev/null || true)
+        [[ -n "$update_pendiente" ]] && UPDATE_AVAILABLE="$update_pendiente"
+        if [[ -n "$UPDATE_AVAILABLE" ]]; then
+            echo -e "${ORANGE}◈  ¡Nueva versión ${BOLD}${UPDATE_AVAILABLE}${RESET}${ORANGE} disponible!${RESET}"
+            echo -e "${ORANGE}    Opción 19 del menú para actualizar.${RESET}\n"
+        fi
+    fi
 }
 
 # ─── Detección del gestor de paquetes ─────────────────
@@ -284,52 +307,97 @@ system_box() {
 # ═══════════════════════════════════════════════════════
 
 cache() {
-    echo -e "${YELLOW}Limpiando caché...${RESET}"
+    echo -e "${YELLOW}════ Limpieza de caché en un solo toque ════════${RESET}"
+    echo -e "${DIM}   Cachés: gestor oficial, AUR, navegadores, AppImage y sistema.${RESET}"
+    echo ""
     local pkg
     pkg=$(detectar_pkg_manager)
-    local antes_cache antes_thumb antes_total
-    antes_cache=$(tamano_de "/var/cache")
-    antes_thumb=$(tamano_de "$HOME/.cache/thumbnails")
-    antes_total=$((antes_cache + antes_thumb))
 
+    # ── Caché del gestor de paquetes oficial ──
+    local antes=0 despues=0 liberado=0
+    antes=$(( antes + $(tamano_de "/var/cache") ))
     case "$pkg" in
         pacman)
             if command -v paccache >/dev/null; then
-                spinner "Purgando caché de pacman" sudo paccache -r
+                spinner "Purga caché oficial (pacman)" sudo paccache -rk2
             else
                 echo -e "${RED}paccache no encontrado. Instala pacman-contrib.${RESET}"
             fi
             ;;
         apt)
-            spinner "Limpiando caché de apt" sudo apt clean
+            spinner "Limpiando caché oficial (apt)" sudo apt clean
             ;;
         dnf)
-            spinner "Limpiando caché de dnf" sudo dnf clean all
+            spinner "Limpiando caché oficial (dnf)" sudo dnf clean all
             ;;
         zypper)
-            spinner "Limpiando caché de zypper" sudo zypper clean -a
+            spinner "Limpiando caché oficial (zypper)" sudo zypper clean -a
             ;;
         apk)
-            spinner "Limpiando caché de apk" apk cache clean
+            spinner "Limpiando caché oficial (apk)" apk cache clean
             ;;
         *)
             echo -e "${RED}Gestor de paquetes no soportado.${RESET}"
             ;;
     esac
 
-    progress_bar "Eliminando miniaturas" 1
-    rm -rf "${HOME:?}/.cache/thumbnails/"* 2>/dev/null || true
+    # ── Caché de AUR / asistentes ──
+    local aur_dir=("$HOME/.cache/yay" "$HOME/.cache/paru" "$HOME/.cache/pamac" "$HOME/.cache/aur")
+    local _d
+    for _d in "${aur_dir[@]}"; do
+        antes=$(( antes + $(tamano_de "$_d") ))
+    done
+    for _d in "${aur_dir[@]}"; do
+        if [[ -d "$_d" ]]; then
+            spinner "Purga caché AUR ($(basename "$_d"))" rm -rf "$_d"
+        fi
+    done
 
-    local despues_cache despues_thumb despues_total liberado
-    despues_cache=$(tamano_de "/var/cache")
-    despues_thumb=$(tamano_de "$HOME/.cache/thumbnails")
-    despues_total=$((despues_cache + despues_thumb))
-    liberado=$((antes_total - despues_total))
+    # ── Cachés de navegadores ──
+    local browsers=(
+        "$HOME/.cache/google-chrome" "$HOME/.cache/chromium"
+        "$HOME/.cache/brave-browser" "$HOME/.cache/microsoft-edge"
+        "$HOME/.cache/vivaldi" "$HOME/.cache/opera"
+        "$HOME/.cache/mozilla/firefox" "$HOME/.cache/firefox"
+    )
+    for _d in "${browsers[@]}"; do antes=$((antes + $(tamano_de "$_d") )); done
+    for _d in "${browsers[@]}"; do
+        [[ -d "$_d" ]] && { spinner "Navegador: $(basename "$_d")" rm -rf "$_d"; }
+    done
+
+    # ── Caché de AppImage ──
+    local appimage_dir=(
+        "$HOME/.cache/AppImage" "$HOME/.cache/appimages"
+        "$HOME/.cache/AppImageLauncher" "$HOME/.local/share/appimagekit"
+    )
+    for _d in "${appimage_dir[@]}"; do antes=$((antes + $(tamano_de "$_d") )); done
+    for _d in "${appimage_dir[@]}"; do
+        [[ -d "$_d" ]] && { spinner "AppImage: $(basename "$_d")" rm -rf "$_d"; }
+    done
+
+    # ── Miniaturas y fontconfig ──
+    local sys_cache=(
+        "$HOME/.cache/thumbnails" "$HOME/.cache/fontconfig"
+        "$HOME/.cache/dconf" "$HOME/.cache/wallpaper"
+    )
+    for c in "${sys_cache[@]}"; do antes=$((antes + $(tamano_de "$c") )); done
+    for c in "${sys_cache[@]}"; do
+        [[ -d "$c" ]] && { spinner "Sistema: $(basename "$c")" rm -rf "$c"; }
+    done
+
+    # ── Logs del sistema (vacuum) ──
+    if command -v journalctl >/dev/null 2>&1; then
+        spinner "Sistema: reduciendo logs a 7 días" sudo journalctl --vacuum-time=7d
+    fi
+
+    # ── Reporte final ──────────────────────────────
+    despues=$(( $(tamano_de "/var/cache") + $(tamano_de "$HOME/.cache") ))
+    liberado=$((antes - despues))
     (( liberado < 0 )) && liberado=0
-
-    echo -e "${GREEN}✔ Caché limpiada${RESET}"
+    echo ""
+    echo -e "${GREEN}✔ Limpieza completada${RESET}"
     echo -e "${DIM}   Espacio liberado (aprox.): $(formatear_bytes "$liberado")${RESET}"
-    registrar_ultima_accion "Limpieza de caché ($(formatear_bytes "$liberado") liberados)"
+    registrar_ultima_accion "Limpieza de caché todo-en-uno ($(formatear_bytes "$liberado") liberados)"
     pause
 }
 
@@ -440,14 +508,11 @@ papelera() {
 #  FUNCIONES DE ANÁLISIS
 # ═══════════════════════════════════════════════════════
 
+# Modela una ruta para mostrar: sustituye $HOME por ~ (ahorra columna sin recortar).
 truncate_path() {
     local path="$1"
-    local max_len=34
-    if [[ ${#path} -le $max_len ]]; then
-        echo "$path"
-    else
-        echo "${path:0:$((max_len - 3))}..."
-    fi
+    path="${path/$HOME/\~}"
+    echo "$path"
 }
 
 directorios_vacios() {
@@ -465,9 +530,9 @@ directorios_vacios() {
         printf "       ${YELLOW}📁 Directorios vacíos: %3d${RESET}\n" "$total"
         printf "       ${YELLOW}   (mostrando primeros 5)${RESET}\n"
         head -5 "$tmpfile" | while IFS= read -r dir; do
-            local short="${dir/$HOME/~}"
-            short=$(truncate_path "$short")
-            printf "       %-34s\n" "$short"
+            local short
+            short=$(truncate_path "$dir")
+            printf "       %s\n" "$short"
         done
         if [[ "$total" -gt 5 ]]; then
             printf "       ... y %3d más ...\n" $((total - 5))
@@ -654,6 +719,20 @@ optimizar_hardware() {
     echo -e "${CYAN}│${RESET} Analizando CPU, RAM, almacenamiento, swap y salud...${CYAN}"
     echo -e "${CYAN}╰──────────────────────────────────────────────────────────────────╯${RESET}"
 
+    # ── Perfil de uso: rendimiento vs estabilidad ──
+    echo ""
+    echo -e "${BOLD}¿Qué perfil prefieres para las recomendaciones?${RESET}"
+    echo -e "${CYAN}  1)${RESET} ${BOLD}Máximo rendimiento${RESET}  ${DIM}(más swap, mejor latencia)${RESET}"
+    echo -e "${CYAN}  2)${RESET} ${BOLD}Máxima estabilidad${RESET}    ${DIM}(swap justo, más conservador)${RESET}"
+    local perfil
+    read -rp "Elige [1/2] (por defecto: 1): " perfil || perfil="1"
+    if [[ "$perfil" == "2" ]]; then
+        perfil="estabilidad"
+    else
+        perfil="rendimiento"
+    fi
+    echo ""
+
     # ── Detección de disco (multiplataforma) ──
     local base_dev es_nvme=0 rotational tipo_disco
     base_dev=$(detectar_dispositivo_base)
@@ -719,13 +798,19 @@ optimizar_hardware() {
     fi
 
     # ── Cálculo de recomendaciones ──
+    # swap base: rendimiento busca que todo quepa (swap = RAM para ≤16G);
+    # estabilidad usa la mitad (menos swap roto a disco).
     local swap_rec swappiness_rec governor_rec sched_rec
     if (( ram_mb <= 2048 )); then
         swap_rec=$((ram_mb * 2))
     elif (( ram_mb <= 8192 )); then
         swap_rec=$ram_mb
     elif (( ram_mb <= 16384 )); then
-        swap_rec=$((ram_mb / 2))
+        if [[ "$perfil" == "rendimiento" ]]; then
+            swap_rec=$ram_mb
+        else
+            swap_rec=$((ram_mb / 2))
+        fi
     else
         swap_rec=4096
     fi
@@ -735,19 +820,33 @@ optimizar_hardware() {
         (( swap_rec < 512 )) && swap_rec=512
     fi
 
-    if (( ram_mb >= 16384 )); then
-        swappiness_rec=5
-    elif (( ram_mb >= 8192 )); then
-        swappiness_rec=10
+    if [[ "$perfil" == "estabilidad" ]]; then
+        # conservador: suficiente para no OOM, sin gastar disco de sobra
+        if (( ram_mb >= 16384 )); then
+            swappiness_rec=10
+        elif (( ram_mb >= 8192 )); then
+            swappiness_rec=20
+        else
+            swappiness_rec=30
+        fi
     else
-        swappiness_rec=30
+        # rendimiento: mantiene apps en RAM lo más posible
+        if (( ram_mb >= 16384 )); then
+            swappiness_rec=5
+        elif (( ram_mb >= 8192 )); then
+            swappiness_rec=10
+        else
+            swappiness_rec=15
+        fi
     fi
     [[ "$tipo_disco" == "HDD" ]] && swappiness_rec=$((swappiness_rec + 20))
     (( swappiness_rec > 60 )) && swappiness_rec=60
     (( swap_zram == 1 )) && swappiness_rec=100
 
     local governor_rec
-    if [[ "$es_laptop" == "Sí" ]]; then
+    if [[ "$perfil" == "estabilidad" ]]; then
+        governor_rec="powersave"
+    elif [[ "$es_laptop" == "Sí" ]]; then
         governor_rec="powersave"
     else
         governor_rec="performance"
@@ -783,23 +882,23 @@ optimizar_hardware() {
     echo -e "${CYAN}│${RESET} Gobernador actual:          ${governor_actual}"
     echo -e "${CYAN}│${RESET} Gobernadores disponibles:   ${gobernadores:-N/D}"
     echo -e "${CYAN}│${RESET} Planificador E/S:           ${sched_actual}"
-    echo -e "${CYAN}│${RESET} Swap total:                 ${swap_total} MB"$( \
-       (( swap_zram == 1 )) && echo " (zram activo)" )""
+    echo -e "${CYAN}│${RESET} Swap total:                 ${swap_total} MB$( (( swap_zram == 1 )) && echo " (zram activo)" )"
     echo -e "${CYAN}╰──────────────────────────────────────────────────────────────────╯${RESET}"
 
     # ── Detección de errores de hardware ──
+    # (Aquí son señales de alerta; el diagnóstico detallado es la opción 7)
     echo ""
     echo -e "${CYAN}${BOLD}╭─ Salud / errores de hardware ──────────────────────────────────╮${RESET}"
     if (( err_total > 0 )); then
-        echo -e "${CYAN}│${RESET} ${RED}⚠${RESET} Se detectaron ${BOLD}${err_total}${RESET} evento(s) de error/críticos en el kernel (últ. 7 días)."
-        echo -e "${CYAN}│${RESET} Usa la opción 7 del menú para un diagnóstico detallado."
+        echo -e "${CYAN}│${RESET} ${ORANGE}◐${RESET} Se hallaron ${BOLD}${err_total}${RESET} evento(s) con aspecto de error en el kernel."
+        echo -e "${CYAN}│${RESET} ${DIM}Pueden ser benignos; usa la opción 7 para clasificarlos.${RESET}"
     else
         echo -e "${CYAN}│${RESET} ${GREEN}✔${RESET} Sin errores críticos de hardware detectados recientemente."
     fi
     echo -e "${CYAN}╰──────────────────────────────────────────────────────────────────╯${RESET}"
 
     echo ""
-    echo -e "${CYAN}${BOLD}╭─ Recomendaciones ───────────────────────────────────────────────╮${RESET}"
+    echo -e "${CYAN}${BOLD}╭─ Recomendaciones (perfil: ${BOLD}${perfil}${RESET}${CYAN}) ───────────────────────╮${RESET}"
     echo -e "${CYAN}│${RESET} Swap recomendado:              ${swap_rec} MB  (actual: ${swap_total} MB)"
     echo -e "${CYAN}│${RESET} vm.swappiness recomendado:     ${swappiness_rec}"
     echo -e "${CYAN}│${RESET} Gobernador de CPU recomendado: ${governor_rec}"
@@ -893,7 +992,7 @@ EOF
     sudo chmod +x "$bin"
     sudo tee "$svc" >/dev/null <<EOF
 [Unit]
-Description=Fikures de rendimiento Kyro
+Description=Ajustes de rendimiento Kyro
 After=multi-user.target
 
 [Service]
@@ -905,7 +1004,7 @@ WantedBy=multi-user.target
 EOF
     sudo systemctl daemon-reload >/dev/null 2>&1
     sudo systemctl enable --now kyro-perf.service >/dev/null 2>&1 && \
-        echo -e "${GREEN}✔ Servicio kyro-perf activado y en boots${RESET}" || \
+        echo -e "${GREEN}✔ Servicio kyro-perf activado y persistente en cada arranque${RESET}" || \
         echo -e "${YELLOW}⚠ No se pudo activar el servicio (systemd no disponible?)${RESET}"
 }
 
@@ -920,17 +1019,21 @@ errores_hardware() {
     echo ""
 
     # 1) Kernel / journalctl
-    local kernel_src=""
+    # Se guarda el log en crudo para poder distinguir señales reales del ruido
+    # habitual (USB, ACPI, "pcie"...). Los términos genéricos NO son fallo.
+    local kernel_raw="" kernel_src=""
     if command -v journalctl >/dev/null 2>&1; then
-        kernel_src=$(journalctl -k -o cat --no-pager --since "7 days ago" 2>/dev/null | grep -iE 'error|fail|critical|panic|oops|fault|thermal|nvme|pcie' | tail -15 || true)
+        kernel_raw=$(journalctl -k -o cat --no-pager --since "7 days ago" 2>/dev/null)
     elif command -v dmesg >/dev/null 2>&1; then
-        kernel_src=$(dmesg 2>/dev/null | tail -200 | grep -iE 'error|fail|critical|panic|oops|fault|thermal|nvme|pcie' | tail -15 || true)
+        kernel_raw=$(dmesg 2>/dev/null)
     fi
-    echo -e "${BOLD}▸ Errores del kernel (últimos eventos):${RESET}"
+    kernel_src=$(printf '%s\n' "$kernel_raw" | grep -iE 'error|fail|critical|panic|oops|fault|thermal|nvme|pcie|usb' | tail -15 || true)
+    echo -e "${BOLD}▸ Posibles eventos del kernel (últimos):${RESET}"
+    echo -e "${DIM}   (pueden ser benignos; se clasifican más abajo)${RESET}"
     if [[ -n "$kernel_src" ]]; then
         echo "$kernel_src"
     else
-        echo -e "   ${GREEN}✔ No se encontraron errores recientes del kernel.${RESET}"
+        echo -e "   ${GREEN}✔ No se encontraron eventos recientes del kernel.${RESET}"
     fi
     echo ""
 
@@ -988,13 +1091,98 @@ errores_hardware() {
 
     echo ""
     echo -e "${BOLD}▸ Conclusión:${RESET}"
-    local err_n="$kernel_src"
-    if [[ -n "$err_n" ]] && echo "$err_n" | grep -qiE 'error|fail|critical|panic|fault|nvme|pcie'; then
-        echo -e "   ${RED}⚠ Se observaron errores. Si persisten, revisa RAM (memtest86+)\n      y alimentación; monitorea SMART e temperaturas de disco.${RESET}"
+
+    # Señales FUERTES = fallos reales de hardware (alta certeza).
+    # Señales DÉBILES = términos genéricos que también aparecen en uso normal.
+    local senales_fuertes="" senales_debiles=""
+    senales_fuertes=$(printf '%s\n' "$kernel_raw" | grep -iE \
+        'Hardware Error|Machine Check|MCE|uncorrectable|ECC.*error|panic:|Oops:|BUG:|kernel BUG|fatal|hotplug|I/O error|No such device|failed command|CE\b|UE\b' | head -8 || true)
+    senales_debiles=$(printf '%s\n' "$kernel_raw" | grep -iE 'error|fail|critical|fault|thermal|nvme|pcie|usb' | head -8 || true)
+
+    # Estado de los discos (referencia cruzada): si algún disco ha fallado
+    # en salud SMART, es señal fuerte.
+    local smart_fallido=""
+    if command -v smartctl >/dev/null 2>&1; then
+        while IFS= read -r d; do
+            [[ -n "$d" ]] || continue
+            if sudo smartctl -H "/dev/$d" 2>/dev/null | grep -q 'FAILED'; then
+                smart_fallido="/dev/$d"
+                break
+            fi
+        done < <(lsblk -dno NAME 2>/dev/null | grep -E '^(sd[a-z]|nvme[0-9]n[0-9]+)$')
+    fi
+
+    if [[ -n "$senales_fuertes" ]] || [[ -n "$smart_fallido" ]]; then
+        echo -e "   ${RED}⚠ Hay señales de posible fallo de hardware.${RESET}"
+        [[ -n "$smart_fallido" ]] && echo -e "      ${RED}S.M.A.R.T.: ${smart_fallido} reporta FALLO de salud.${RESET}"
+        [[ -n "$senales_fuertes" ]] && echo -e "      ${DIM}Eventos:${RESET}" && printf '      %s\n' "$senales_fuertes"
+        echo -e "   ${DIM}Si persisten, revisa RAM (memtest86+), alimentación y discos.${RESET}"
+    elif [[ -n "$senales_debiles" ]]; then
+        echo -e "   ${YELLOW}⚠ Hay eventos con aspecto de error, pero pueden ser no problemáticos.${RESET}"
+        echo -e "   ${YELLOW}No se puede asegurar con certeza que exista un fallo real.${RESET}"
+        echo -e "   ${DIM}Para confirmar o descartar, haz un análisis a profundidad A.${RESET}"
+        if confirmar "→ Realizar análisis a profundidad de los eventos detectados?"; then
+            analizar_a_fondo_errores
+        fi
     else
-        echo -e "   ${GREEN}✔ Sin señales de fallo de hardware recientes.${RESET}"
+        echo -e "   ${GREEN}✔ Sin señales de fallo de hardware.${RESET}"
     fi
     registrar_ultima_accion "Diagnóstico de errores de hardware"
+    pause
+}
+
+# ─── Análisis a fondo de los eventos detectados ────────
+# ayudta a confirmar/descartar si los eventos del kernel son un fallo real.
+analizar_a_fondo_errores() {
+    clear
+    echo -e "${CYAN}${BOLD}╭─ Análisis a fondo ──────────────────────────────────────────────╮${RESET}"
+    echo -e "${CYAN}│${RESET} Diagnóstico detallado de los eventos registrados.${CYAN}"
+    echo -e "${CYAN}╰──────────────────────────────────────────────────────────────────╯${RESET}"
+    echo ""
+
+    echo -e "${BOLD}▸ Últimas 50 líneas del anillo del kernel:${RESET}"
+    if command -v journalctl >/dev/null 2>&1; then
+        journalctl -k --no-pager -n 50 2>/dev/null | tail -50 || true
+    else
+        dmesg 2>/dev/null | tail -50 || true
+    fi
+    echo ""
+
+    echo -e "${BOLD}▸ Temperatura (zonas térmicas):${RESET}"
+    if compgen -G "/sys/class/thermal/thermal_zone*/temp" >/dev/null; then
+        for tz in /sys/class/thermal/thermal_zone*/temp; do
+            local ttipo="" tval=""
+            ttipo=$(cat "$(dirname "$tz")/type" 2>/dev/null)
+            tval=$(cat "$tz" 2>/dev/null)
+            (( tval > 0 )) && echo "      ${ttipo:-thermal_zone}: $((tval / 1000))°C"
+        done
+    else
+        echo -e "   ${YELLOW}Sin zonas térmicas expuestas.${RESET}"
+    fi
+    echo ""
+
+    echo -e "${BOLD}▸ Estado SMART detallado de cada disco:${RESET}"
+    if command -v smartctl >/dev/null 2>&1; then
+        local dsd=()
+        mapfile -d $'\n' dsd < <(lsblk -dno NAME 2>/dev/null | grep -E '^(sd[a-z]|nvme[0-9]n[0-9]+)$')
+        for d in "${dsd[@]}"; do
+            d=$(echo "$d" | tr -d '\n ')
+            [[ -n "$d" ]] || continue
+            echo "  ── /dev/$d ──"
+            sudo smartctl -A "/dev/$d" 2>/dev/null | grep -E 'Reallocated_Sector|Current_Pending|Offline_Unc|Temperature|UDMA_CRC|Raw_Read|Command_Timeout' || echo "    (sin atributos críticos)"
+        done
+    else
+        echo -e "   ${YELLOW}smartmontools no instalado.${RESET}"
+    fi
+    echo ""
+
+    echo -e "${BOLD}▸ Memoria y errores de MCE (si están disponibles):${RESET}"
+    if [[ -d /sys/devices/system/memory ]]; then
+        echo "  Log de MCE: $(journalctl -k --no-pager | grep -ci 'machine check' 2>/dev/null || echo 0) evento(s)"
+    fi
+    echo -e "${DIM}Si el análisis profundo confirma fallos, ejecuta memtest86+ una noche.${RESET}"
+    echo ""
+    registrar_ultima_accion "Análisis a fondo de errores de hardware"
     pause
 }
 
@@ -1336,15 +1524,24 @@ corrupcion() {
         pacman)
             # Compatible con locales EN/ES: busca "N missing files" o
             # "N archivos no encontrados" con N > 0 y omite los "0".
+            # Nota: el grep se ejecuta en un subshell aparte para que
+            # 'pipefail' no marque como fallo una verificación sin errores.
             spinner "Verificando integridad con pacman" bash -c \
-                "sudo pacman -Qk 2>/dev/null | grep -E '[1-9][0-9]* (missing files|archivos no encontrados)' > '$tmpfile'"
+                "sudo pacman -Qk 2>/dev/null > '$tmpfile'"
             rc_verif=$?
+            if (( rc_verif == 0 )); then
+                local problemas
+                problemas=$(grep -E '[1-9][0-9]* (missing files|archivos no encontrados)' "$tmpfile" 2>/dev/null | head -c 1048576)
+                echo -n "$problemas" > "$tmpfile"
+            fi
             ;;
         apt)
             if command -v debsums >/dev/null; then
+                # debsums -c devuelve 1 cuando detecta archivos corruptos
+                # (por eso se fuerza rc_verif=0: la ejecución sí fue correcta).
                 spinner "Verificando integridad con debsums" bash -c \
                     "sudo debsums -c 2>/dev/null > '$tmpfile'"
-                rc_verif=$?
+                rc_verif=0
             else
                 echo -e "${RED}Instala 'debsums' para esta verificación.${RESET}"
                 disponible=0
@@ -1542,15 +1739,203 @@ servicios_fallidos() {
 }
 
 # ═══════════════════════════════════════════════════════
+#  FUNCIONES NUEVAS: ACTUALIZACIONES Y README
+# ═══════════════════════════════════════════════════════
+
+# Descarga el script actualizado a un archivo temporal.
+# Uso: descargar_script_remoto <archivo_destino>
+descargar_script_remoto() {
+    local destino="$1"
+    if command -v curl >/dev/null 2>&1; then
+        if curl -fsSL --connect-timeout 10 --max-time 60 -o "$destino" "$UPDATE_URL" 2>/dev/null; then
+            return 0
+        fi
+    fi
+    if command -v wget >/dev/null 2>&1; then
+        if wget -q --show-progress --timeout=60 -O "$destino" "$UPDATE_URL" 2>/dev/null; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# Devuelve la versión más reciente publicada en UPDATE_URL,
+# o vacío si no se pudo consultar.
+obtener_version_remota() {
+    local linea
+    linea=$(curl -fsSL --connect-timeout 5 --max-time 10 "$UPDATE_URL" 2>/dev/null | grep -m1 '^VERSION=' )
+    [[ -n "$linea" ]] && echo "${linea#VERSION=}" | tr -d '"' || echo ""
+}
+
+# Compara dos versiones "a.b.c": devuelve 0 si $1 > $2.
+version_es_mayor() {
+    local v1="$1" v2="$2"
+    [[ "$v1" == "$v2" ]] && return 1
+    if [[ "$(printf '%s\n%s\n' "$v1" "$v2" | sort -V | head -n1)" == "$v2" ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# Consulta si hay una actualización y muestra un aviso en la cabecera.
+# Uso: comprobar_update [--aviso]
+comprobar_update() {
+    local remota="$UPDATE_AVAILABLE"
+    [[ -n "$remota" ]] || remota=$(obtener_version_remota)
+
+    if [[ -z "$remota" ]]; then
+        [[ "${1:-}" != "--aviso" ]] && echo -e "${YELLOW}⚠ No se pudo consultar la última versión (sin conexión).${RESET}"
+        return 1
+    fi
+
+    if version_es_mayor "$remota" "$VERSION"; then
+        UPDATE_AVAILABLE="$remota"
+        if [[ "${1:-}" != "--aviso" ]]; then
+            echo -e "${ORANGE}◈ Nueva versión disponible: ${BOLD}${remota}${RESET} ${DIM}(actual: ${VERSION})${RESET}"
+        fi
+        return 0
+    fi
+    return 1
+}
+
+# comprobar_update_fondo: ejecuta el chequeo en segundo plano y guarda el
+# resultado en un archivo provisional (no bloquea el menú si no hay red).
+# Uso: comprobar_update_fondo
+comprobar_update_fondo() {
+    mkdir -p "$(dirname "$UPDATE_STATE_FILE")" 2>/dev/null || true
+    local remota
+    remota=$(obtener_version_remota)
+    if [[ -n "$remota" ]] && version_es_mayor "$remota" "$VERSION"; then
+        echo "$remota" > "$UPDATE_STATE_FILE" 2>/dev/null
+    else
+        rm -f "$UPDATE_STATE_FILE" 2>/dev/null
+    fi
+}
+
+# actualizaciones_auto: revisa si hay una nueva versión y,
+# si existe, ofrece actualizarla manualmente (como un "botón").
+actualizaciones_auto() {
+    clear
+    echo -e "${CYAN}${BOLD}╭─ Actualizador de Kyro ────────────────────────────────╮${RESET}"
+    echo -e "${CYAN}│${RESET} Tu versión: ${BOLD}${VERSION}${RESET}${CYAN}"
+    echo -e "${CYAN}╰────────────────────────────────────────────────────────────╯${RESET}"
+    echo ""
+
+    local remota
+    remota=$(obtener_version_remota)
+
+    if [[ -z "$remota" ]]; then
+        echo -e "${YELLOW}No se pudo contactar el servidor de actualizaciones.${RESET}"
+        echo -e "${DIM}Revisa tu conexión o la variable UPDATE_URL (línea 27).${RESET}"
+        pause
+        return
+    fi
+
+    if ! version_es_mayor "$remota" "$VERSION"; then
+        echo -e "${GREEN}✔ Ya estás en la última versión (${VERSION}).${RESET}"
+        registrar_ultima_accion "Comprobación de actualizaciones (sin novedades)"
+        pause
+        return
+    fi
+
+    echo -e "${GREEN}✔ Se encontró una actualización:${RESET} ${BOLD}${VERSION} → ${remota}${RESET}"
+    echo ""
+
+    if confirmar "¿Descargar e instalar la versión ${remota} ahora?"; then
+        local tmp
+        tmp=$(mktemp)
+        echo -e "${YELLOW}Descargando Kyro ${remota}...${RESET}"
+        if descargar_script_remoto "$tmp"; then
+            # Sustituye el script actual por el nuevo y lo deja ejecutable.
+            if mv "$tmp" "$SCRIPT_PATH" && chmod +x "$SCRIPT_PATH"; then
+                echo -e "${GREEN}✔ Kyro actualizado a ${remota}. Se relanzará con la nueva versión.${RESET}"
+                registrar_ultima_accion "Actualización de Kyro (${VERSION} → ${remota})"
+                exec bash "$SCRIPT_PATH"
+            else
+                echo -e "${RED}✘ No se pudo reemplazar el script (permisos?).${RESET}"
+                rm -f "$tmp"
+            fi
+        else
+            echo -e "${RED}✘ Error al descargar la actualización.${RESET}"
+            rm -f "$tmp"
+        fi
+    else
+        echo -e "${YELLOW}Quedaste en la versión ${VERSION}. Puedes actualizar después.${RESET}"
+    fi
+    pause
+}
+
+# Crea el README.md si no existe (con descripción y créditos).
+crear_readme() {
+    if [[ -f "$README_PATH" ]]; then
+        return
+    fi
+    echo -e "${YELLOW}No se encontró README.md. Creándolo...${RESET}"
+    cat > "$README_PATH" <<EOF
+# Kyro Optimizer
+
+Optimizador y herramienta de mantenimiento del sistema para Linux.
+
+## Qué hace
+
+- Limpia la caché en un solo toque: gestor oficial, AUR, navegadores, AppImage y sistema.
+- Optimiza hardware: CPU, RAM, swap, planificador de E/S y gobernador.
+- Detecta y diagnostica errores de hardware (SMART, kernel, temperatura).
+- Analiza directorios vacíos, integridad de paquetes y archivos grandes.
+- Repara servicios systemd fallidos (incluidos swaps rotos en btrfs).
+- Monitoriza CPU, RAM y temperatura en tiempo real.
+- Se actualiza automáticamente a sí mismo (¡eso hace este mismo archivo!).
+
+## Instalación
+
+\`\`\`bash
+chmod +x Kyro.sh && ./Kyro.sh
+\`\`\`
+
+Requiere: **bash >= 4**, **coreutils**, **du**, **numfmt** y sudo.
+
+## Actualizaciones
+
+Kyro comprueba la versión más reciente en el repositorio del proyecto y
+te avisa para que la instales manualmente desde el menú.
+
+## Créditos
+
+Kyro fue creado y desarrollado por **comuza**.
+
+Licencia: **GPL-3.0** — usa, modifica y comparte.
+EOF
+}
+
+# abrir_readme: muestra el README en pantalla.
+abrir_readme() {
+    crear_readme
+    clear
+    echo -e "${CYAN}${BOLD}╭─ Kyro Optimizer ─ README ───────────────────────────╮${RESET}"
+    echo -e "${CYAN}╰──────────────────────────────────────────────────────────╯${RESET}"
+    echo ""
+    if command -v less >/dev/null 2>&1; then
+        less -R "$README_PATH"
+    elif command -v more >/dev/null 2>&1; then
+        more "$README_PATH"
+    else
+        cat "$README_PATH"
+    fi
+    registrar_ultima_accion "Abrir README"
+    pause
+}
+
+# ═══════════════════════════════════════════════════════
 #  MENÚ PRINCIPAL
 # ═══════════════════════════════════════════════════════
 menu() {
+    comprobar_update_fondo &
     while true; do
         header
 
         echo -e "
 ${CYAN}${BOLD} ──── MANTENIMIENTO ─────────────────────────────────${RESET}
-${CYAN} 1)${RESET} Limpiar caché                                    ${CYAN} 2)${RESET} Paquetes huérfanos
+${CYAN} 1)${RESET} Limpiar caché (todo en uno)                        ${CYAN} 2)${RESET} Paquetes huérfanos
 ${CYAN} 3)${RESET} Limpiar logs del sistema                         ${CYAN} 4)${RESET} Vaciar papelera
 
 ${CYAN}${BOLD} ──── OPTIMIZACIÓN ───────────────────────────────────${RESET}
@@ -1571,6 +1956,9 @@ ${CYAN}${BOLD} ──── EXTRAS ───────────────
         echo -e "${CYAN}16)${RESET} Limpiar kernels antiguos                           ${CYAN}17)${RESET} Revisar .pacnew/.pacsave"
         echo -e "${CYAN}18)${RESET} Diagnóstico de red y DNS
 "
+        echo -e "${CYAN}${BOLD} ──── KYRO ───────────────────────────────────────────────${RESET}"
+        echo -e "${CYAN}19)${RESET} Actualizaciones (auto)                             ${CYAN}20)${RESET} Ver README"
+
         echo -e "${CYAN} ───────────────────────────────────────────────────────────${RESET}"
         echo -e "${CYAN} S)${RESET} Resumen del sistema                    ${RED}0)${RESET} Salir"
         echo -e "${CYAN} ───────────────────────────────────────────────────────────${RESET}"
@@ -1596,6 +1984,8 @@ ${CYAN}${BOLD} ──── EXTRAS ───────────────
             16) limpiar_kernels_viejos ;;
             17) revisar_pacnew ;;
             18) diagnostico_red ;;
+            19) actualizaciones_auto ;;
+            20) abrir_readme ;;
             [Ss]) system_box ;;
             0|q|Q) exit 0 ;;
             *) echo -e "${RED}Opción inválida${RESET}"; sleep 1 ;;
