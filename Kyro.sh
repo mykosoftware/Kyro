@@ -3,11 +3,11 @@
 # ═══════════════════════════════════════════════════════
 #  Kyro Optimizer – Mantenimiento y diagnóstico del sistema
 #  Licencia: GPL-3.0
-#  Versión: 4.11
+#  Versión: 4.2
 # ═══════════════════════════════════════════════════════
 
 set -uo pipefail
-VERSION="4.11"
+VERSION="4.2"
 
 # ─── Colores ───────────────────────────────────────────
 CYAN="\e[36m"
@@ -34,7 +34,7 @@ README_PATH="$SCRIPT_DIR/README.md"
 UPDATE_AVAILABLE=""
 UPDATE_STATE_FILE="$HOME/.cache/kyro_update"
 
-# URL del script en el repositorio. Cámbiala si usas otro host/rama.
+# URL del script en el repositorio.
 UPDATE_URL="${UPDATE_URL:-https://raw.githubusercontent.com/mykosoftware/Kyro/main/Kyro.sh}"
 
 # ─── Utilidades ────────────────────────────────────────
@@ -71,8 +71,6 @@ PROTEGER_RUTAS=(
     "$HOME/GameHub"
 )
 
-# ¿Está la ruta (o algo dentro de ella) bajo una ruta protegida?
-# Uso: if ruta_protegida "$dir"; then ... no tocar ...; fi
 ruta_protegida() {
     local r="$1" p pp rp m mm
     rp=$(readlink -f "$r" 2>/dev/null || echo "$r")
@@ -265,6 +263,7 @@ header() {
     echo -e "${GREEN}  ████   █  █  ${GRAY} \  \        /  /      ${RESET}"
     echo -e "${GREEN}  █  █   █  █  ${GRAY}  '------------'       ${RESET}"
     echo -e "${GREEN}  █   █  ████  ${GRAY}.----------------.     ${RESET}"
+    echo -e "               ${GRAY}(__________________)    ${RESET}"
 
     echo -e "${CYAN}
         Kyro Optimizer v${VERSION}
@@ -2382,20 +2381,49 @@ comprobar_update_fondo() {
     fi
 }
 
-# Sustituye el script actual por uno recién descargado de forma robusta:
-# - `install` copia el contenido y escribe en el destino (sirve entre
-#   dispositivos distintos, p. ej. /tmp → /usr/local/bin).
-# - Usa sudo si el directorio destino no es escribible por el usuario
-#   (instalaciones en /usr/local/bin, /usr/bin, etc.).
+# Sustituye el script actual por uno recién descargado de forma robusta.
+# `install` escribe directamente sobre el archivo en ejecución y por eso puede
+# fallar con "Text file busy" (ETXTBSY). La estrategia aquí es:
+#   1) Copiar el nuevo script a un temporal en el MISMO directorio.
+#   2) Renombrarlo sobre el destino con mv: rename() reemplaza la entrada del
+#      directorio y funciona aunque el script esté corriendo.
+#   3) Si aún falla, borrar el destino y volver a instalarlo (quita-y-pon).
+# Usa sudo cuando el directorio destino no sea escribible por el usuario
+# (instalaciones en /usr/local/bin, /usr/bin, etc.).
 reemplazar_script() {
-    local tmp="$1" dest="$2" dir upd=0
+    local tmp="$1" dest="$2" dir upd=0 new
     dir=$(dirname "$dest")
+    new="$dir/.kyro_new_$$"
+
+    # ── 1) Copia al temporal del mismo directorio + rename ──
     if [[ -w "$dir" ]]; then
-        install -m 755 "$tmp" "$dest" 2>/dev/null && upd=1
+        if cp -f "$tmp" "$new" 2>/dev/null && chmod 755 "$new" 2>/dev/null && mv -f "$new" "$dest" 2>/dev/null; then
+            upd=1
+        else
+            rm -f "$new" 2>/dev/null
+        fi
+    fi
+
+    # ── 2) Con sudo (directorio de sistema) ──
+    if [[ "$upd" -eq 0 ]]; then
+        if sudo cp -f "$tmp" "$new" 2>/dev/null && sudo chmod 755 "$new" 2>/dev/null && sudo mv -f "$new" "$dest" 2>/dev/null; then
+            upd=1
+        fi
+        sudo rm -f "$new" 2>/dev/null
+    fi
+
+    # ── 3) Último recurso: borrar y reinstalar ──
+    if [[ "$upd" -eq 0 ]]; then
+        if [[ -w "$dir" ]]; then
+            rm -f "$dest" 2>/dev/null
+            install -m 755 "$tmp" "$dest" 2>/dev/null && upd=1
+        fi
     fi
     if [[ "$upd" -eq 0 ]]; then
+        sudo rm -f "$dest" 2>/dev/null
         sudo install -m 755 "$tmp" "$dest" 2>/dev/null && upd=1
     fi
+
     [[ "$upd" -eq 1 ]]
 }
 
@@ -2433,6 +2461,14 @@ actualizaciones_auto() {
         tmp=$(mktemp)
         echo -e "${YELLOW}Descargando Kyro ${remota}...${RESET}"
         if descargar_script_remoto "$tmp"; then
+            # Valida el script descargado antes de tocar el instalado.
+            if ! bash -n "$tmp" 2>/dev/null; then
+                echo -e "${RED}✘ La descarga está corrupta (no es un script válido).${RESET}"
+                echo -e "${DIM}   No se tocó tu instalación. Inténtalo de nuevo.${RESET}"
+                rm -f "$tmp"
+                pause
+                return
+            fi
             # Sustituye el script actual por el nuevo y lo deja ejecutable.
             if reemplazar_script "$tmp" "$SCRIPT_PATH" && chmod +x "$SCRIPT_PATH" 2>/dev/null; then
                 echo -e "${GREEN}✔ Kyro actualizado a ${remota}. Se relanzará con la nueva versión.${RESET}"
