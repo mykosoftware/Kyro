@@ -1865,8 +1865,24 @@ actualizaciones_auto() {
     pause
 }
 
+# Resuelve dónde leer/escribir el README. Prioridad:
+#   1) README.md del repositorio en HOME (si el script se ejecuta desde ahí).
+#   2) README.md junto al script instalado (si existe y es legible).
+#   3) Ruta escribible en $HOME (para instalaciones en /usr, etc.).
+resolver_readme() {
+    if [[ -f "$HOME/Kyro/README.md" ]]; then
+        README_PATH="$HOME/Kyro/README.md"
+    elif [[ -f "$SCRIPT_DIR/README.md" ]] && [[ -r "$SCRIPT_DIR/README.md" ]]; then
+        README_PATH="$SCRIPT_DIR/README.md"
+    else
+        mkdir -p "$HOME/.local/share/kyro" 2>/dev/null || true
+        README_PATH="$HOME/.local/share/kyro/README.md"
+    fi
+}
+
 # Crea el README.md si no existe (con descripción y créditos).
 crear_readme() {
+    resolver_readme
     if [[ -f "$README_PATH" ]]; then
         return
     fi
