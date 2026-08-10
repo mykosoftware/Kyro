@@ -3,11 +3,11 @@
 # ═══════════════════════════════════════════════════════
 #  Kyro Optimizer – Mantenimiento y diagnóstico del sistema
 #  Licencia: GPL-3.0
-#  Versión: 4.2
+#  Versión: 4.21
 # ═══════════════════════════════════════════════════════
 
 set -uo pipefail
-VERSION="4.2"
+VERSION="4.21"
 
 # ─── Colores ───────────────────────────────────────────
 CYAN="\e[36m"
@@ -263,7 +263,6 @@ header() {
     echo -e "${GREEN}  ████   █  █  ${GRAY} \  \        /  /      ${RESET}"
     echo -e "${GREEN}  █  █   █  █  ${GRAY}  '------------'       ${RESET}"
     echo -e "${GREEN}  █   █  ████  ${GRAY}.----------------.     ${RESET}"
-    echo -e "               ${GRAY}(__________________)    ${RESET}"
 
     echo -e "${CYAN}
         Kyro Optimizer v${VERSION}
