@@ -3,11 +3,11 @@
 # ═══════════════════════════════════════════════════════
 #  Kyro Optimizer – Mantenimiento y diagnóstico del sistema
 #  Licencia: GPL-3.0
-#  Versión: 4.3
+#  Versión: 5
 # ═══════════════════════════════════════════════════════
 
 set -uo pipefail
-VERSION="4.3"
+VERSION="5"
 
 # ─── Colores ───────────────────────────────────────────
 CYAN="\e[36m"
@@ -16,6 +16,7 @@ YELLOW="\e[33m"
 RED="\e[31m"
 MAGENTA="\e[35m"
 ORANGE="\e[38;5;208m"
+WHITE="\e[1;97m"
 BOLD="\e[1m"
 DIM="\e[2m"
 RESET="\e[0m"
@@ -51,7 +52,6 @@ confirmar() {
 # ─── Rutas protegidas: jamás se eliminan ───────────────
 # Wine, Proton y herramientas de compatibilidad (prefijos, prefixs de
 # Steam/Lutris/Heroic/Bottles, etc.). La limpieza y el borrado por
-# selección comprueban siempre esta lista antes de tocar algo.
 PROTEGER_RUTAS=(
     "$HOME/.wine"
     "$HOME/.local/share/wineprefixes"
@@ -263,7 +263,6 @@ header() {
     echo -e "${GREEN}  ████   █  █  ${GRAY} \  \        /  /      ${RESET}"
     echo -e "${GREEN}  █  █   █  █  ${GRAY}  '------------'       ${RESET}"
     echo -e "${GREEN}  █   █  ████  ${GRAY}.----------------.     ${RESET}"
-    echo -e "               ${GRAY}(__________________)    ${RESET}"
 
     echo -e "${CYAN}
         Kyro Optimizer v${VERSION}
@@ -324,9 +323,9 @@ detectar_gpu_vendor() {
 
 # ─── Resumen del sistema (ventanita) ──────────────────
 system_box() {
-    local kernel uptime shell mem_used mem_total mem_pct disk_used disk_total disk_pct
+    clear
+    local kernel shell mem_used mem_total mem_pct mem_avail
     kernel=$(uname -r)
-    uptime=$(uptime -p 2>/dev/null | sed 's/^up //')
     shell=$(basename "${SHELL:-$0}")
     local pkgs="?"
     local user=${USER:-$(whoami)}
@@ -334,10 +333,57 @@ system_box() {
     local distro
     distro=$(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"')
     [[ -z "$distro" ]] && distro="Desconocida"
+    local arch
+    arch=$(uname -m)
 
-    read -r mem_total mem_used mem_pct < <(free -m | awk '/^Mem:/ {printf "%s %s %d", $2, $3, ($3/$2)*100}')
-    read -r disk_total disk_used disk_pct < <(df -h "$HOME" | awk 'NR==2 {gsub("%","",$5); print $2, $3, $5}')
+    # CPU
+    local cpu_model cores cpu_pct_1m
+    cpu_model=$(grep -m1 "model name" /proc/cpuinfo 2>/dev/null | cut -d: -f2 | sed 's/^ *//')
+    [[ -z "$cpu_model" ]] && cpu_model="Desconocido"
+    cores=$(nproc 2>/dev/null || echo "?")
+    local load1 load5 load15
+    read -r load1 load5 load15 _ < /proc/loadavg 2>/dev/null
+    load1=${load1:-0}; load5=${load5:-0}; load15=${load15:-0}
 
+    # GPU
+    local gpu
+    gpu=$(detectar_gpu_modelo)
+    [[ -z "$gpu" ]] && gpu="Desconocida"
+
+    # Memoria
+    read -r mem_total mem_used mem_avail mem_pct < <(free -m | awk '/^Mem:/ {printf "%s %s %s %d", $2, $3, $7, ($3/$2)*100}')
+    [[ -z "$mem_avail" ]] && mem_avail=0
+
+    # Swap
+    local swap_total
+    read -r swap_total _ <<< "$(info_swap)"
+
+    # Disco (HOME y raíz)
+    local disk_total disk_used disk_pct root_total root_used root_pct
+    read -r disk_total disk_used disk_pct < <(df -h "$HOME" 2>/dev/null | awk 'NR==2 {gsub("%","",$5); print $2, $3, $5}')
+    read -r root_total root_used root_pct < <(df -h / 2>/dev/null | awk 'NR==2 {gsub("%","",$5); print $2, $3, $5}')
+
+    # Uptime
+    local uptime up_days up_hrs up_min
+    uptime=$(uptime -p 2>/dev/null | sed 's/^up //')
+    if command -v uptime >/dev/null 2>&1; then
+        : 
+    fi
+
+    # Temperatura
+    local tempv=0 tempc
+    if command -v sensors >/dev/null 2>&1; then
+        tempc=$(sensors 2>/dev/null | grep -m1 -oE '[0-9]+\.[0-9]+°C' | grep -oE '^[0-9]+' | head -1)
+        [[ -n "$tempc" ]] && tempv=$tempc
+    elif compgen -G "/sys/class/thermal/thermal_zone*/temp" >/dev/null; then
+        local tz tv
+        for tz in /sys/class/thermal/thermal_zone*/temp; do
+            tv=$(cat "$tz" 2>/dev/null)
+            (( tv > tempv )) && tempv=$((tv / 1000))
+        done
+    fi
+
+    # Paquetes + gestor
     local pkg_manager
     pkg_manager=$(detectar_pkg_manager)
     case "$pkg_manager" in
@@ -348,29 +394,95 @@ system_box() {
         apk)    pkgs=$(apk list --installed 2>/dev/null | wc -l) ;;
     esac
 
-    local linea1="    kernel       $(printf '%-20s' "$kernel")"
-    local linea2="    distro       $(printf '%-20s' "$distro")"
-    local linea3="    shell        $(printf '%-20s' "$shell")"
-    local linea4="    mem          $(printf '%-20s' "${mem_used}MB / ${mem_total}MB")"
-    local linea5="    pkgs         $(printf '%-20s' "$pkgs")"
-    local linea6="    user         $(printf '%-20s' "$user")"
-    local linea7="    hname        $(printf '%-20s' "$hostname")"
+    # Escritorio / sesión
+    local de terminal session
+    de="${XDG_CURRENT_DESKTOP:-${DESKTOP_SESSION:-n/a}}"
+    terminal="${TERM_PROGRAM:-${TERM:-}}"
+    session="${XDG_SESSION_TYPE:-n/a}"
 
-    echo -e "${CYAN}"
-    echo "     ╭───────────────────────────────────╮"
-    echo "$linea1"
-    echo "$linea2"
-    echo "$linea3"
-    echo "$linea4"
-    echo "$linea5"
-    echo "$linea6"
-    echo "$linea7"
-    echo "     ╰───────────────────────────────────╯"
-    echo -e "${RESET}"
-    echo -e "${DIM}   uptime: ${uptime}${RESET}"
+    # Red
+    local ip wan
+    ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | head -1 | cut -d/ -f1)
+    [[ -z "$ip" ]] && ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    [[ -z "$ip" ]] && ip="n/a"
 
-    echo -e "${BOLD}Uso de RAM:${RESET}   $(barra_pct "${mem_pct:-0}")"
-    echo -e "${BOLD}Uso de disco (${HOME}):${RESET} $(barra_pct "${disk_pct:-0}")  (${disk_used} / ${disk_total})"
+    # Procesos
+    local procs
+    procs=$(ps -e --no-headers 2>/dev/null | wc -l)
+    [[ -z "$procs" ]] && procs=0
+
+    # Kernel errors 7 días
+    local kerr
+    kerr=$(journalctl -k -p err --since "-7 days" -o cat 2>/dev/null | grep -icE 'error|fail|critical|panic|oops' || true)
+
+    # Última acción registrada
+    local ultima
+    ultima=$(cat "$STATE_FILE" 2>/dev/null | head -1 | cut -d'|' -f1)
+    [[ -z "$ultima" ]] && ultima="—"
+
+    # ─────────────────────── Render ───────────────────────
+    local W=50
+    local C="${CYAN}" G="${GREEN}" W2="${WHITE}" D="${DIM}" R="${RESET}"
+    local SEP
+    SEP=$(printf '%*s' "$W" | tr ' ' '═')
+    local TOP_IZQ TOP_DER
+    TOP_IZQ=$(printf '%*s' $(( W / 2 - 6 )) | tr ' ' '═')
+    TOP_DER=$(printf '%*s' $(( W - 12 - (W / 2 - 6) )) | tr ' ' '═')
+
+    echo -e "${C}${BOLD}╔${TOP_IZQ} KYRO SYSTEM ${TOP_DER}╗${R}"
+
+    fila_sys() {
+        local lbl="$1" val="$2"
+        local ancho_lbl=${#lbl}
+        local ancho_val=$(( W - ancho_lbl - 2 ))
+        # Recorta valores largos para que nunca rompan la caja.
+        if (( ${#val} > ancho_val )); then
+            val="${val:0:$(( ancho_val - 3 ))}..."
+        fi
+        printf "${C}║${R}  ${C}%s${R}${W2}%-${ancho_val}s${R}${C}║${R}\n" "$lbl" "$val"
+    }
+
+    fila_sys "Distro"       "$distro"
+    fila_sys "Kernel"       "$kernel"
+    fila_sys "Arquitectura" "$arch"
+    fila_sys "Escritorio"   "${de:-n/a}"
+    fila_sys "Sesión"       "${session:-n/a}"
+    fila_sys "Terminal"     "${terminal:-n/a}"
+
+    echo -e "${C}╠${SEP}╣${R}"
+    fila_sys "CPU"          "${cpu_model}  (${cores} núcleos)"
+    fila_sys "Carga"        "$load1 / $load5 / $load15  (1m/5m/15m)"
+    fila_sys "GPU"          "$gpu"
+
+    echo -e "${C}╠${SEP}╣${R}"
+    fila_sys "RAM total"    "${mem_total} MB   (uso ${mem_pct}%)"
+    fila_sys "RAM en uso"   "${mem_used} MB"
+    fila_sys "RAM libre"    "${mem_avail} MB"
+    fila_sys "Swap"         "${swap_total} MB"
+
+    echo -e "${C}╠${SEP}╣${R}"
+    fila_sys "Disco HOME"   "$disk_used / $disk_total  (${disk_pct}%)"
+    fila_sys "Disco raíz"   "$root_used / $root_total  (${root_pct}%)"
+    fila_sys "Temperatura"  "${tempv:-0}°C"
+    fila_sys "Procesos"     "$procs"
+    fila_sys "Err. kernel"  "$kerr  (últ. 7 días)"
+
+    echo -e "${C}╠${SEP}╣${R}"
+    fila_sys "Gestor"       "${pkg_manager:-n/a}"
+    fila_sys "Paquetes"     "$pkgs"
+    fila_sys "Usuario"      "$user"
+    fila_sys "Host"         "$hostname"
+    fila_sys "IP LAN"       "${ip:-n/a}"
+
+    echo -e "${C}╚${SEP}╝${R}"
+
+    echo ""
+    echo -e "   ${D}Uptime:${R} ${W2}${uptime}${R}   ${D}Última acción:${R} ${G}${ultima}${R}"
+    echo ""
+
+    # ── Barras de uso ──
+    echo -e "   ${BOLD}Uso de RAM:${RESET}   $(barra_pct "${mem_pct:-0}")"
+    echo -e "   ${BOLD}Uso de disco:${RESET} $(barra_pct "${disk_pct:-0}")  ${D}(${disk_used} / ${disk_total} en ${HOME})${R}"
 
     pause
 }
@@ -379,89 +491,141 @@ system_box() {
 #  FUNCIONES DE LIMPIEZA
 # ═══════════════════════════════════════════════════════
 
-cache() {
-    echo -e "${YELLOW}════ Limpieza de caché en un solo toque ════════${RESET}"
-    echo -e "${DIM}   Cachés: gestor oficial, AUR, navegadores, AppImage y sistema.${RESET}"
-    echo ""
-    local pkg
-    pkg=$(detectar_pkg_manager)
-
-    # ── Caché del gestor de paquetes oficial ──
-    local antes=0 despues=0 liberado=0
-    antes=$(( antes + $(tamano_de "/var/cache") ))
-    case "$pkg" in
-        pacman)
-            if command -v paccache >/dev/null; then
-                spinner "Purga caché oficial (pacman)" sudo paccache -rk2
-            else
-                echo -e "${RED}paccache no encontrado. Instala pacman-contrib.${RESET}"
-            fi
-            ;;
-        apt)
-            spinner "Limpiando caché oficial (apt)" sudo apt clean
-            ;;
-        dnf)
-            spinner "Limpiando caché oficial (dnf)" sudo dnf clean all
-            ;;
-        zypper)
-            spinner "Limpiando caché oficial (zypper)" sudo zypper clean -a
-            ;;
-        apk)
-            spinner "Limpiando caché oficial (apk)" apk cache clean
-            ;;
-        *)
-            echo -e "${RED}Gestor de paquetes no soportado.${RESET}"
-            ;;
-    esac
-
-    # ── Caché de AUR / asistentes ──
-    local aur_dir=("$HOME/.cache/yay" "$HOME/.cache/paru" "$HOME/.cache/pamac" "$HOME/.cache/aur")
-    local _d
-    for _d in "${aur_dir[@]}"; do
-        antes=$(( antes + $(tamano_de "$_d") ))
-    done
-    for _d in "${aur_dir[@]}"; do
-        if [[ -d "$_d" ]]; then
-            spinner "Purga caché AUR ($(basename "$_d"))" rm -rf "$_d"
+# Elimina una ruta y devuelve el espacio realmente liberado (bytes).
+# Mide el tamaño ANTES de borrar (con permisos de superusuario si el
+# directorio pertenece a root) y reporta cuánto se pudo quitar. Esto evita
+# el "0B" que ocurría al medir árboles completos con du que necesitaban root.
+eliminar_y_medir() {
+    local ruta="$1" mostrar="$2" antes=0 rc=0
+    [[ -e "$ruta" ]] || { echo 0; return; }
+    if [[ -d "$ruta" ]]; then
+        antes=$(sudo -n du -sb "$ruta" 2>/dev/null || du -sb "$ruta" 2>/dev/null || echo 0)
+        antes="${antes%%[[:space:]]*}"
+        [[ "$antes" =~ ^[0-9]+$ ]] || antes=0
+    else
+        antes=$(stat -c %s "$ruta" 2>/dev/null || echo 0)
+        [[ "$antes" =~ ^[0-9]+$ ]] || antes=0
+    fi
+    antes=${antes:-0}
+    if [[ -d "$ruta" || -f "$ruta" ]]; then
+        if [[ -w "$(dirname "$ruta")" ]]; then
+            rm -rf "$ruta" 2>/dev/null && rc=0 || rc=1
+        else
+            sudo rm -rf "$ruta" 2>/dev/null && rc=0 || rc=1
         fi
+        if [[ "${mostrar:-1}" == "1" ]]; then
+            echo -e "   ${GREEN}✔${RESET} $(truncate_path "$ruta")  ${DIM}($(formatear_bytes "$antes"))${RESET}" >&2
+        fi
+    fi
+    if [[ "$rc" -eq 0 ]]; then echo "$antes"; else echo 0; fi
+}
+
+cache() {
+    echo -e "${YELLOW}════════════════════════════════════════════════════════════${RESET}"
+    echo -e "${BOLD}  🧹  Limpieza de caché todo-en-uno${RESET}"
+    echo -e "${DIM}     Gestor oficial · AUR · Navegadores · Apps · Sistema${RESET}"
+    echo -e "${YELLOW}════════════════════════════════════════════════════════════${RESET}"
+    echo ""
+    local pkg liberado
+    pkg=$(detectar_pkg_manager)
+    liberado=0
+
+    # ── 1) Caché del gestor de paquetes oficial ──
+    if [[ "$(id -u)" -ne 0 ]]; then
+        case "$pkg" in
+            pacman)
+                if command -v paccache >/dev/null; then
+                    spinner "Purga caché oficial (pacman)" sudo paccache -rk2
+                else
+                    echo -e "${RED}paccache no encontrado. Instala pacman-contrib.${RESET}"
+                fi
+                ;;
+            apt)
+                spinner "Limpiando caché oficial (apt)" sudo apt clean
+                ;;
+            dnf)
+                spinner "Limpiando caché oficial (dnf)" sudo dnf clean all
+                ;;
+            zypper)
+                spinner "Limpiando caché oficial (zypper)" sudo zypper clean -a
+                ;;
+            apk)
+                spinner "Limpiando caché oficial (apk)" apk cache clean
+                ;;
+        esac
+    fi
+
+    # ── 2) Caché de AUR / asistentes ──
+    local aur_dir=("$HOME/.cache/yay" "$HOME/.cache/paru" "$HOME/.cache/pamac" "$HOME/.cache/aur" "$HOME/.cache/aurs")
+    for _d in "${aur_dir[@]}"; do
+        [[ -d "$_d" ]] && liberado=$((liberado + $(eliminar_y_medir "$_d" 1)))
     done
 
-    # ── Cachés de navegadores ──
+    # ── 3) Cachés de navegadores ──
     local browsers=(
-        "$HOME/.cache/google-chrome" "$HOME/.cache/chromium"
-        "$HOME/.cache/brave-browser" "$HOME/.cache/microsoft-edge"
-        "$HOME/.cache/vivaldi" "$HOME/.cache/opera"
-        "$HOME/.cache/mozilla/firefox" "$HOME/.cache/firefox"
+        "$HOME/.cache/google-chrome" "$HOME/.cache/chromium" "$HOME/.cache/chromium/Default/Cache"
+        "$HOME/.cache/brave-browser" "$HOME/.cache/microsoft-edge" "$HOME/.cache/vivaldi"
+        "$HOME/.cache/opera" "$HOME/.cache/opera-beta" "$HOME/.cache/mozilla/firefox"
+        "$HOME/.cache/firefox" "$HOME/.cache/librewolf" "$HOME/.cache/torbrowser"
+        "$HOME/.cache/zen" "$HOME/.cache/waterfox" "$HOME/.cache/falkon"
     )
-    for _d in "${browsers[@]}"; do antes=$((antes + $(tamano_de "$_d") )); done
     for _d in "${browsers[@]}"; do
-        [[ -d "$_d" ]] && { spinner "Navegador: $(basename "$_d")" rm -rf "$_d"; }
+        [[ -d "$_d" ]] && liberado=$((liberado + $(eliminar_y_medir "$_d" 1)))
     done
 
-    # ── Caché de AppImage ──
+    # ── 4) Caché de AppImage ──
     local appimage_dir=(
-        "$HOME/.cache/AppImage" "$HOME/.cache/appimages"
-        "$HOME/.cache/AppImageLauncher" "$HOME/.local/share/appimagekit"
+        "$HOME/.cache/AppImage" "$HOME/.cache/appimages" "$HOME/.cache/AppImageLauncher"
+        "$HOME/.local/share/appimagekit"
     )
-    for _d in "${appimage_dir[@]}"; do antes=$((antes + $(tamano_de "$_d") )); done
     for _d in "${appimage_dir[@]}"; do
-        [[ -d "$_d" ]] && { spinner "AppImage: $(basename "$_d")" rm -rf "$_d"; }
+        [[ -d "$_d" ]] && liberado=$((liberado + $(eliminar_y_medir "$_d" 1)))
     done
 
-    # ── Miniaturas, fontconfig y cachés de bajo riesgo ──
+    # ── 5) Miniaturas, fontconfig y cachés de bajo riesgo ──
     local sys_cache=(
-        "$HOME/.cache/thumbnails" "$HOME/.cache/fontconfig"
-        "$HOME/.cache/dconf" "$HOME/.cache/wallpaper"
-        "$HOME/.cache/mesa_shader_cache" "$HOME/.cache/electron"
+        "$HOME/.cache/thumbnails" "$HOME/.cache/fontconfig" "$HOME/.cache/dconf"
+        "$HOME/.cache/wallpaper" "$HOME/.cache/mesa_shader_cache" "$HOME/.cache/electron"
         "$HOME/.cache/menus" "$HOME/.cache/event-sound-catalog.tdb"
-        "$HOME/.cache/node-gyp" "$HOME/.cache/go-build"
+        "$HOME/.cache/node-gyp" "$HOME/.cache/go-build" "$HOME/.cache/gopls"
+        "$HOME/.cache/rubocop_cache" "$HOME/.cache/rubygems" "$HOME/.cache/matplotlib"
+        "$HOME/.cache/jupyter" "$HOME/.cache/mimeapps.list"
+        "$HOME/.cache/speech-dispatcher" "$HOME/.cache/webkitgtk"
+        "$HOME/.cache/gtk-3.0" "$HOME/.cache/icons"
     )
-    for c in "${sys_cache[@]}"; do antes=$((antes + $(tamano_de "$c") )); done
     for c in "${sys_cache[@]}"; do
-        [[ -d "$c" || -f "$c" ]] && { spinner "Sistema: $(basename "$c")" rm -rf "$c"; }
+        [[ -d "$c" || -f "$c" ]] && liberado=$((liberado + $(eliminar_y_medir "$c" 1)))
     done
 
-    # ── Logs del sistema (vacuum) y núcleos de crash antiguos ──
+    # ── 6) Cachés de lenguajes / dev ──
+    local lang_cache=(
+        "$HOME/.cache/pip" "$HOME/.cache/uv" "$HOME/.cache/pipx"
+        "$HOME/.cache/composer" "$HOME/.cache/pypoetry" "$HOME/.cache/pipenv"
+        "$HOME/.cache/poetry" "$HOME/.cache/deno" "$HOME/.cache/bun"
+        "$HOME/.cache/yarn" "$HOME/.cache/pnpm" "$HOME/.npm/_cacache"
+        "$HOME/.cache/rustls" "$HOME/.cache/mix" "$HOME/.cache/mypy_cache"
+        "$HOME/.cache/huggingface" "$HOME/.cache/ms-playwright"
+        "$HOME/.cache/parcel" "$HOME/.cache/hugo_cache" "$HOME/.cache/solana"
+        "$HOME/.cargo/registry/cache"
+    )
+    for _d in "${lang_cache[@]}"; do
+        [[ -d "$_d" ]] && liberado=$((liberado + $(eliminar_y_medir "$_d" 1)))
+    done
+
+    # ── 7) Cachés de apps de mensajería y escritorio ──
+    local app_cache=(
+        "$HOME/.cache/discord" "$HOME/.cache/slack" "$HOME/.cache/spotify"
+        "$HOME/.cache/signal-desktop" "$HOME/.cache/Code" "$HOME/.cache/codium"
+        "$HOME/.cache/gramps" "$HOME/.cache/Microsoft/clipit" "$HOME/.cache/JetBrains"
+        "$HOME/.cache/google-chrome-unstable" "$HOME/.cache/telegram-desktop"
+        "$HOME/.cache/zoom" "$HOME/.cache/teams" "$HOME/.cache/evolution"
+        "$HOME/.cache/Thunderbird" "$HOME/.cache/obs-studio" "$HOME/.cache/qutebrowser"
+    )
+    for _d in "${app_cache[@]}"; do
+        [[ -d "$_d" ]] && liberado=$((liberado + $(eliminar_y_medir "$_d" 1)))
+    done
+
+    # ── 8) Logs del sistema (vacuum) y núcleos de crash antiguos ──
     if command -v journalctl >/dev/null 2>&1; then
         spinner "Sistema: reduciendo logs a 7 días" sudo journalctl --vacuum-time=7d
     fi
@@ -476,13 +640,12 @@ cache() {
         fi
     fi
 
-    # ── Reporte final ──────────────────────────────
-    despues=$(( $(tamano_de "/var/cache") + $(tamano_de "$HOME/.cache") ))
-    liberado=$((antes - despues))
-    (( liberado < 0 )) && liberado=0
+    # ── Reporte final (espacio real liberado, suma de cada elemento) ──
     echo ""
-    echo -e "${GREEN}✔ Limpieza completada${RESET}"
-    echo -e "${DIM}   Espacio liberado (aprox.): $(formatear_bytes "$liberado")${RESET}"
+    echo -e "${YELLOW}════════════════════════════════════════════════════════════${RESET}"
+    echo -e "${GREEN}✔  Limpieza de caché completada${RESET}"
+    echo -e "${DIM}   Espacio realmente liberado: ${BOLD}${WHITE}$(formatear_bytes "$liberado")${RESET}${DIM}${RESET}"
+    echo -e "${YELLOW}════════════════════════════════════════════════════════════${RESET}"
     registrar_ultima_accion "Limpieza de caché todo-en-uno ($(formatear_bytes "$liberado") liberados)"
     pause
 }
@@ -2794,16 +2957,57 @@ limpieza_profunda() {
     fi
     echo ""
 
+    # ── 1) Coredumps antiguos ──
     if [[ -d /var/lib/systemd/coredump ]] && confirmar "→ ¿Eliminar volcados de memoria (coredumps) de más de 14 días?"; then
         sudo find /var/lib/systemd/coredump -type f -mtime +14 -delete 2>/dev/null
         echo -e "   ${GREEN}✔ Coredumps antiguos eliminados${RESET}"
     fi
 
+    # ── 2) Kernels antiguos (deja el actual + el anterior) ──
+    if command -v pacman >/dev/null 2>&1 && confirmar "→ ¿Eliminar kernels antiguos conservando el actual y el anterior?"; then
+        local k_actual k_ant
+        k_actual=$(uname -r | sed 's/-cachyos$//;s/^[0-9.-]*-//' )
+        k_actual=$(uname -r | rev | cut -d- -f2- | rev)
+        local instalados nueva_inst
+        instalados=$(pacman -Qq 2>/dev/null | grep -E '^(linux|linux-hardened|linux-lts|linux-zen|linux-cachyos)( |$)' | grep -v 'headers\|docs' | grep -vE '-(headers|firmware|api-headers)$' | sort -V)
+        if [[ -n "$instalados" ]]; then
+            # elimina todos menos los 2 más recientes por nombre de paquete
+            echo -e "   ${DIM}   Kernels instalados:${RESET}"
+            echo "$instalados" | sed 's/^/      /'
+            if confirmar "     → ¿Eliminar ahora esos kernels (dejar los 2 más nuevos)?"; then
+                local resto cuenta headline
+                resto=$(echo "$instalados" | sort -V | head -n -2 | tr '\n' ' ')
+                if [[ -n "$resto" ]]; then
+                    sudo pacman -Rns --noconfirm $resto 2>/dev/null || echo -e "   ${YELLOW}⚠ No se pudieron eliminar algunos kernels.${RESET}"
+                    echo -e "   ${GREEN}✔ Kernels antiguos eliminados: $resto${RESET}"
+                fi
+            fi
+        else
+            echo -e "   ${YELLOW}⚠ kernel no identificable (¿distro con kernel de paquete distinto?).${RESET}"
+        fi
+    fi
+
+    # ── 3) Huérfanos generales ──
+    if command -v pacman >/dev/null 2>&1 && confirmar "→ ¿Eliminar paquetes huérfanos (dependencias sin uso)?"; then
+        local huerc
+        huerc=$(pacman -Qtdq 2>/dev/null | wc -l)
+        if (( huerc > 0 )); then
+            sudo pacman -Rns --noconfirm $(pacman -Qtdq 2>/dev/null) 2>/dev/null
+            echo -e "   ${GREEN}✔ ${huerc} paquete(s) huérfano(s) eliminados${RESET}"
+        else
+            echo -e "   ${YELLOW}⚠ No hay huérfanos.${RESET}"
+        fi
+    fi
+
+    # ── 4) Flatpak ──
     if command -v flatpak >/dev/null 2>&1 && confirmar "→ ¿Eliminar runtimes/paquetes Flatpak sin uso?"; then
         flatpak uninstall --unused --assumeyes 2>/dev/null || true
         spinner "Flatpak: caché" bash -c "rm -rf \"$HOME/.var/app\"/*/cache 2>/dev/null"
+        # también el caché de thumbnailer flatpak
+        rm -rf "$HOME/.cache/thumbnails" 2>/dev/null
     fi
 
+    # ── 5) Snap ──
     if command -v snap >/dev/null 2>&1 && confirmar "→ ¿Limpiar revisiones antiguas (disables) de Snap?"; then
         local sname srev
         while read -r sname srev; do
@@ -2813,33 +3017,68 @@ limpieza_profunda() {
         echo -e "   ${GREEN}✔ Snap: revisiones deshabilitadas eliminadas${RESET}"
     fi
 
+    # ── 6) Docker ──
     if command -v docker >/dev/null 2>&1 && confirmar "→ ¿Podar todo lo no usado de Docker (contenedores parados, redes e imágenes)? [y/N]"; then
         sudo docker system prune -af 2>/dev/null || sudo docker system prune -f 2>/dev/null
         echo -e "   ${GREEN}✔ Docker podado${RESET}"
     fi
 
+    # ── 7) Podman ──
     if command -v podman >/dev/null 2>&1 && confirmar "→ ¿Podar todo lo no usado de Podman?"; then
         sudo podman system prune -af 2>/dev/null || true
         echo -e "   ${GREEN}✔ Podman podado${RESET}"
     fi
 
+    # ── 8) Logs ──
     if command -v journalctl >/dev/null 2>&1 && confirmar "→ ¿Limitar los logs del sistema a 200 MB?"; then
         sudo journalctl --vacuum-size=200M 2>/dev/null
-        echo -e "   ${GREEN}✔ Logs limitados a 200 MB${RESET}"
+        sudo journalctl --vacuum-time=30d 2>/dev/null
+        echo -e "   ${GREEN}✔ Logs limitados a 200 MB / 30 días${RESET}"
     fi
 
-    local antes extras c liberado
-    antes=0
+    # ── 9) /var/log accesibles y logs de apps ──
+    if confirmar "→ ¿Vaciar logs antiguos de /var/log (apache, nginx, mysql, etc.)?"; then
+        sudo find /var/log -type f \( -name '*.gz' -o -name '*.old' -o -name '*.1' -o -name '*.2' -o -name '*.3' -o -name '*.4' \) -delete 2>/dev/null
+        echo -e "   ${GREEN}✔ Logs rotados antiguos eliminados${RESET}"
+    fi
+
+    # ── 10) Restos de paquetes (#.pacnew / .pacsave) ──
+    if confirmar "→ ¿Gestionar archivos .pacnew/.pacsave (reemplazar o borrar)? [y/N]"; then
+        local pacf
+        pacf=$(find /etc -type f \( -name '*.pacnew' -o -name '*.pacsave' \) 2>/dev/null | wc -l)
+        if (( pacf > 0 )); then
+            sudo find /etc -type f -name '*.pacnew' -exec sh -c 'mv "$1" "${1%.pacnew}"' _ {} \; 2>/dev/null
+            sudo find /etc -type f -name '*.pacsave' -delete 2>/dev/null
+            echo -e "   ${GREEN}✔ ${pacf} archivo(s) de configuración gestionados${RESET}"
+        else
+            echo -e "   ${YELLOW}⚠ No hay .pacnew/.pacsave.${RESET}"
+        fi
+    fi
+
+    # ── 11) Cachés de runtime bajo riesgo ──
+    local extras liberado_extra
     extras=(
         "$HOME/.cache/electron" "$HOME/.cache/mesa_shader_cache"
         "$HOME/.cache/node-gyp" "$HOME/.cache/ms-playwright" "$HOME/.cache/huggingface"
+        "$HOME/.cache/Yarn" "$HOME/.cache/next" "$HOME/.cache/vite"
+        "$HOME/.cache/parcel" "$HOME/.cache/webpack" "$HOME/.cache/deno"
+        "$HOME/.cache/esbuild" "$HOME/.cache/torch" "$HOME/.cache/paddle"
+        "$HOME/.thumbnail_normal"
     )
-    for c in "${extras[@]}"; do antes=$(( antes + $(tamano_de "$c") )); done
-    if (( antes > 0 )) && confirmar "→ ¿Eliminar cachés de runtime bajo riesgo ($(formatear_bytes "$antes"))?"; then
-        for c in "${extras[@]}"; do rm -rf "$c" 2>/dev/null; done
-        echo -e "   ${GREEN}✔ Cachés de runtime eliminados ($(formatear_bytes "$antes"))${RESET}"
+    liberado_extra=0
+    for c in "${extras[@]}"; do
+        [[ -e "$c" ]] && liberado_extra=$((liberado_extra + $(eliminar_y_medir "$c" 0)))
+    done
+    if (( liberado_extra > 0 )) && confirmar "→ ¿Eliminar cachés de runtime en desuso ($(formatear_bytes "$liberado_extra"))?"; then
+        for c in "${extras[@]}"; do
+            [[ -e "$c" ]] && rm -rf "$c" 2>/dev/null
+        done
+        echo -e "   ${GREEN}✔ Cachés de runtime eliminados ($(formatear_bytes "$liberado_extra"))${RESET}"
+    elif (( liberado_extra > 0 )); then
+        echo -e "   ${DIM}   Cachés de runtime conservados.${RESET}"
     fi
 
+    # ── 12) paccache -ruk0 ──
     if command -v pacman >/dev/null 2>&1 && confirmar "→ ¿Limpiar también los paquetes de la caché ya desinstalados (paccache -ruk0)?"; then
         if command -v paccache >/dev/null 2>&1; then
             sudo paccache -ruk0 2>/dev/null
@@ -2850,7 +3089,9 @@ limpieza_profunda() {
     fi
 
     echo ""
-    echo -e "${GREEN}✔ Limpieza profunda finalizada${RESET}"
+    echo -e "${YELLOW}════════════════════════════════════════════════════════════${RESET}"
+    echo -e "${GREEN}✔  Limpieza profunda finalizada${RESET}"
+    echo -e "${YELLOW}════════════════════════════════════════════════════════════${RESET}"
     registrar_ultima_accion "Limpieza profunda"
     pause
 }
@@ -3084,6 +3325,319 @@ restaurar_optimizacion() {
 }
 
 # ═══════════════════════════════════════════════════════
+#  ESTABILIDAD DEL SISTEMA
+# ═══════════════════════════════════════════════════════
+
+# 26) Estabilizador del sistema: detecta y repara problemas comunes de
+# estabilidad sin tocar configuración del usuario. Todo se confirma antes.
+estabilizador() {
+    clear
+    echo -e "${CYAN}${BOLD}╭─ Estabilizador del sistema ──────────────────────────────────╮${RESET}"
+    echo -e "${CYAN}│${RESET} Detecta y corrige problemas comunes de estabilidad.${CYAN}"
+    echo -e "${CYAN}╰──────────────────────────────────────────────────────────────────╯${RESET}"
+    echo ""
+    echo -e "${DIM}   Se comprobará cada área y solo se modificará lo que tú confirmes.${RESET}"
+    echo ""
+
+    if ! confirmar "¿Comenzar el diagnóstico y reparación?"; then
+        echo -e "${YELLOW}Cancelado.${RESET}"
+        pause
+        return
+    fi
+
+    local pkg
+    pkg=$(detectar_pkg_manager)
+
+    # ── 1) Integridad de la base de datos de paquetes ──
+    echo -e "${BOLD}▸ 1) Integridad de paquetes${RESET}"
+    case "$pkg" in
+        pacman)
+            if sudo pacman -Dk 2>/dev/null | grep -iE 'error|unresolvable|missing'; then
+                echo -e "   ${YELLOW}⚠ La base de datos tiene inconsistencia.${RESET}"
+                if confirmar "  → ¿Reconstruir la base de datos (pacman -Dk / refresh)?"; then
+                    sudo pacman -Syy 2>/dev/null
+                    echo -e "   ${GREEN}✔ Base de datos refrescada.${RESET}"
+                fi
+            else
+                echo -e "   ${GREEN}✔ Base de datos de paquetes correcta.${RESET}"
+            fi
+            ;;
+        apt)
+            if sudo dpkg --audit 2>/dev/null | grep -iE 'error|inconsistent|missing'; then
+                echo -e "   ${YELLOW}⚠ dpkg tiene paquetes inconsistentes.${RESET}"
+                if confirmar "  → ¿Intentar reparar (dpkg --configure -a)?"; then
+                    sudo dpkg --configure -a 2>/dev/null
+                    echo -e "   ${GREEN}✔ dpkg reparado.${RESET}"
+                fi
+            else
+                echo -e "   ${GREEN}✔ Base de datos de paquetes correcta.${RESET}"
+            fi
+            ;;
+        *)  echo -e "   ${DIM}   Gestor no soportado, se omite.${RESET}" ;;
+    esac
+
+    # ── 2) Journal de systemd (corrupción/reglas de vaciado) ──
+    echo -e "${BOLD}▸ 2) Journal de systemd${RESET}"
+    if command -v journalctl >/dev/null 2>&1; then
+        if sudo journalctl --verify 2>/dev/null | grep -iE 'fail|error' | grep -v 'no errors'; then
+            echo -e "   ${YELLOW}⚠ El journal presenta errores.${RESET}"
+            if confirmar "  → ¿Rotar y conservar solo 200 MB (descarta corruptos)?"; then
+                sudo journalctl --rotate 2>/dev/null
+                sudo journalctl --vacuum-size=200M 2>/dev/null
+                echo -e "   ${GREEN}✔ Journal rotado y saneado.${RESET}"
+            fi
+        else
+            echo -e "   ${GREEN}✔ Journal íntegro.${RESET}"
+        fi
+        # Asegura límites de crecimiento del journal (evita llenar disco).
+        if ! grep -q 'SystemMaxUse' /etc/systemd/journald.conf 2>/dev/null; then
+            if confirmar "  → ¿Limitar el journal a 300 MB (evita discos llenos)?"; then
+                echo -e "SystemMaxUse=300M\nSystemKeepFree=100M" | sudo tee -a /etc/systemd/journald.conf >/dev/null 2>&1
+                sudo systemctl restart systemd-journald 2>/dev/null || sudo journalctl --flush 2>/dev/null
+                echo -e "   ${GREEN}✔ Journal limitado a 300 MB.${RESET}"
+            fi
+        else
+            echo -e "   ${GREEN}✔ Journal ya limitado.${RESET}"
+        fi
+    else
+        echo -e "   ${DIM}   journalctl no disponible.${RESET}"
+    fi
+
+    # ── 3) Servicios systemd fallidos ──
+    echo -e "${BOLD}▸ 3) Servicios systemd fallidos${RESET}"
+    local fallidos
+    fallidos=$(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}')
+    if [[ -n "$fallidos" ]]; then
+        echo -e "   ${YELLOW}⚠ Servicios fallidos:${RESET}"
+        echo "$fallidos" | sed 's/^/      - /'
+        if confirmar "  → ¿Intentar reiniciarlos?"; then
+            local svc
+            for svc in $fallidos; do
+                sudo systemctl restart "$svc" 2>/dev/null && echo -e "      ${GREEN}✔ ${svc} reiniciado${RESET}" || echo -e "      ${YELLOW}⚠ ${svc} sigue fallando${RESET}"
+            done
+        fi
+    else
+        echo -e "   ${GREEN}✔ Sin servicios fallidos.${RESET}"
+    fi
+
+    # ── 4) Sistema de archivos (correcciones menores) ──
+    echo -e "${BOLD}▸ 4) Sistema de archivos${RESET}"
+    local root_fs
+    root_fs=$(findmnt -no FSTYPE / 2>/dev/null)
+    case "$root_fs" in
+        ext4|ext3)
+            echo -e "   ${DIM}   Unidad: /dev/$(detectar_dispositivo_base) (${root_fs}).${RESET}"
+            if confirmar "  → ¿Marca la unidad para revisión en el próximo arranque (fsck)? [y/N]"; then
+                sudo touch /forcefsck 2>/dev/null && echo -e "   ${GREEN}✔ Revisión programada en el próximo arranque.${RESET}"
+            fi
+            ;;
+        btrfs)
+            if confirmar "  → ¿Ejecutar 'scrub' (verifica/regenera redundancia)?"; then
+                sudo btrfs scrub start / 2>/dev/null && echo -e "   ${GREEN}✔ Scrub de btrfs iniciado.${RESET}"
+            fi
+            ;;
+        *)  echo -e "   ${DIM}   Sistema '${root_fs:-desconocido}': no se requieren acciones.${RESET}" ;;
+    esac
+
+    # ── 5) Particiones montadas correctamente ──
+    echo -e "${BOLD}▸ 5) Tabla de particiones / fstab${RESET}"
+    if command -v mount >/dev/null 2>&1; then
+        local montaje_ok
+        montaje_ok=$(sudo findmnt --verify --verbose 2>/dev/null | grep -c 'Successfully verified' || true)
+        if (( montaje_ok > 0 )); then
+            echo -e "   ${GREEN}✔ /etc/fstab correcto.${RESET}"
+        else
+            echo -e "   ${YELLOW}⚠ No se pudo verificar completamente; revisa con 'findmnt --verify'.${RESET}"
+        fi
+    fi
+
+    # ── 6) Archivos .pacnew/.pacsave ──
+    echo -e "${BOLD}▸ 6) Configuraciones pendientes (.pacnew/.pacsave)${RESET}"
+    local pacn pacs
+    pacn=$(find /etc -type f -name '*.pacnew' 2>/dev/null | wc -l)
+    pacs=$(find /etc -type f -name '*.pacsave' 2>/dev/null | wc -l)
+    echo -e "   ${DIM}   .pacnew: ${pacn} · .pacsave: ${pacs}${RESET}"
+    if (( pacn > 0 && pacs > 0 )) && confirmar "  → ¿Gestionarlos (aplicar .pacnew y borrar .pacsave del sistema)?"; then
+        sudo find /etc -type f -name '*.pacnew' -exec sh -c 'mv "$1" "${1%.pacnew}"' _ {} \; 2>/dev/null
+        sudo find /etc -type f -name '*.pacsave' -delete 2>/dev/null
+        echo -e "   ${GREEN}✔ Configuraciones actualizadas.${RESET}"
+    fi
+
+    # ── 7) Variables de entorno del sistema (locale) ──
+    echo -e "${BOLD}▸ 7) Locale del sistema${RESET}"
+    if locale -a 2>/dev/null | grep -qi "$LANG" 2>/dev/null; then
+        echo -e "   ${GREEN}✔ Locale configurado (${LANG:-n/d}).${RESET}"
+    else
+        echo -e "   ${YELLOW}⚠ El locale ${LANG:-n/d} no está generado.${RESET}"
+        if confirmar "  → ¿Generar los locales activos?"; then
+            sudo locale-gen 2>/dev/null && echo -e "   ${GREEN}✔ Locales regenerados.${RESET}"
+        fi
+    fi
+
+    # ── 8) Firewall activo ──
+    echo -e "${BOLD}▸ 8) Cortafuegos${RESET}"
+    if command -v firewall-cmd >/dev/null 2>&1; then
+        if systemctl is-active --quiet firewalld; then
+            echo -e "   ${GREEN}✔ firewalld activo.${RESET}"
+        else
+            echo -e "   ${YELLOW}⚠ firewalld instalado pero inactivo.${RESET}"
+            if confirmar "  → ¿Activar firewalld?"; then
+                sudo systemctl enable --now firewalld 2>/dev/null && echo -e "   ${GREEN}✔ firewalld activado.${RESET}"
+            fi
+        fi
+    elif command -v ufw >/dev/null 2>&1; then
+        if sudo ufw status 2>/dev/null | grep -q 'Status: active'; then
+            echo -e "   ${GREEN}✔ ufw activo.${RESET}"
+        else
+            echo -e "   ${YELLOW}⚠ ufw instalado pero inactivo.${RESET}"
+            if confirmar "  → ¿Activar ufw?"; then
+                sudo ufw enable 2>/dev/null && echo -e "   ${GREEN}✔ ufw activado.${RESET}"
+            fi
+        fi
+    else
+        echo -e "   ${DIM}   Sin cortafuegos detectado (opcional).${RESET}"
+    fi
+
+    echo ""
+    echo -e "${YELLOW}════════════════════════════════════════════════════════════${RESET}"
+    echo -e "${GREEN}✔  Estabilizador finalizado${RESET}"
+    echo -e "${YELLOW}════════════════════════════════════════════════════════════${RESET}"
+    registrar_ultima_accion "Estabilizador del sistema"
+    pause
+}
+
+# 27) Reparador de paquetes (reinstala archivos perdidos/corruptos).
+reparar_paquetes() {
+    clear
+    echo -e "${CYAN}${BOLD}╭─ Reparador de paquetes ───────────────────────────────────────╮${RESET}"
+    echo -e "${CYAN}│${RESET} Reinstala archivos de paquetes faltantes o dañados.${CYAN}"
+    echo -e "${CYAN}╰──────────────────────────────────────────────────────────────────╯${RESET}"
+    echo ""
+    local pkg
+    pkg=$(detectar_pkg_manager)
+
+    case "$pkg" in
+        pacman)
+            echo -e "${DIM}   Verificando integridad de todos los paquetes...${RESET}"
+            local tmp afuera malos
+            tmp=$(mktemp)
+            spinner "pacman -Qk (verificación)" bash -c \
+                "sudo pacman -Qk 2>/dev/null | grep -E 'illegal package path|No such file|error:' > \"$tmp\""
+            afuera=$(wc -l < "$tmp" 2>/dev/null || echo 0)
+            if (( afuera > 0 )); then
+                echo -e "   ${YELLOW}⚠ ${afuera} paquete(s) con problemas detectados.${RESET}"
+                sed 's/^/      /' "$tmp" | head -20
+                if confirmar "  → ¿Reinstalar esos paquetes?"; then
+                    local lista
+                    lista=$(awk -F': ' '{print $1}' "$tmp" | sort -u | tr '\n' ' ')
+                    [[ -n "$lista" ]] && {
+                        spinner "Reinstalando paquetes dañados" bash -c "sudo pacman -S --noconfirm $lista" || true
+                    }
+                fi
+            else
+                echo -e "   ${GREEN}✔ Ningún paquete con archivos faltantes.${RESET}"
+            fi
+            rm -f "$tmp"
+            ;;
+        apt)
+            echo -e "${DIM}   Reinstalando paquetes rotos (dpkg)...${RESET}"
+            if confirmar "  → ¿Reconfigurar paquetes incompletos (dpkg --configure -a)?"; then
+                sudo dpkg --configure -a 2>/dev/null
+                spinner "Corrigiendo dependencias (apt -f install)" sudo apt-get -y -f install 2>/dev/null
+                echo -e "   ${GREEN}✔ Reparación completada.${RESET}"
+            fi
+            ;;
+        *)
+            echo -e "${RED}Reparador no disponible para este gestor.${RESET}"
+            ;;
+    esac
+    registrar_ultima_accion "Reparador de paquetes"
+    pause
+}
+
+# 28) Diagnóstico completo de estabilidad: lectura de SMART, errores de E/S,
+# swap, temperatura y estado de servicios en un solo informe.
+diagnostico_estabilidad() {
+    clear
+    echo -e "${CYAN}${BOLD}╭─ Diagnóstico integral de estabilidad ──────────────────────────╮${RESET}"
+    echo -e "${CYAN}│${RESET} S.M.A.R.T. · E/S · swap · temperatura · servicios · updates${CYAN}"
+    echo -e "${CYAN}╰──────────────────────────────────────────────────────────────────╯${RESET}"
+    echo ""
+
+    echo -e "${BOLD}▸ Discos (S.M.A.R.T.):${RESET}"
+    local dn smartl=""
+    if command -v smartctl >/dev/null 2>&1; then
+        while IFS= read -r dn; do
+            [[ -n "$dn" ]] || continue
+            [[ -e "/dev/$dn" ]] || continue
+            local linea
+            linea=$(sudo smartctl -H "/dev/$dn" 2>/dev/null | grep 'SMART overall-health')
+            echo -e "   /dev/${dn}: ${linea:-sin datos}"
+            smartl="${smartl}${linea} "
+        done < <(lsblk -dno NAME 2>/dev/null | grep -E '^(sd[a-z]|nvme[0-9]n[0-9]+|mmcblk[0-9]+)$')
+        [[ -z "$smartl" ]] && echo -e "   ${DIM}   smartmontools presente pero sin discos compatibles.${RESET}"
+    else
+        echo -e "   ${YELLOW}⚠ smartmontools no instalado (sudo pacman -S smartmontools).${RESET}"
+    fi
+
+    echo -e "${BOLD}▸ Errores de E/S y kernel (14 días):${RESET}"
+    if command -v journalctl >/dev/null 2>&1; then
+        local io_err
+        io_err=$(journalctl -k --since "-14 days" -o cat 2>/dev/null | grep -icE 'I/O error|blk_update_request|Buffer I/O|READ FPDMA' || true)
+        local kern_err
+        kern_err=$(journalctl -k -p err --since "-14 days" -o cat 2>/dev/null | wc -l)
+        echo -e "   ${DIM}   Errores de E/S de disco: ${io_err} · Errores de kernel (err): ${kern_err}${RESET}"
+    else
+        echo -e "   ${DIM}   journalctl no disponible.${RESET}"
+    fi
+
+    echo -e "${BOLD}▸ Swap:${RESET}"
+    local swap_total swap_zram usada swap_pct
+    read -r swap_total swap_zram _ <<< "$(info_swap)"
+    swap_total=${swap_total:-0}
+    usada=$(free -m 2>/dev/null | awk '/^Swap:/{print $3}')
+    usada=${usada:-0}
+    if (( swap_total > 0 )); then
+        swap_pct=$((usada * 100 / swap_total))
+    else
+        swap_pct=0
+    fi
+    echo -e "   ${DIM}   Total: ${swap_total} MB · En uso: ${usada} MB (${swap_pct}%) · zram: $([ "${swap_zram:-0}" -eq 1 ] && echo Sí || echo No)${RESET}"
+
+    echo -e "${BOLD}▸ Temperatura:${RESET}"
+    local tempv=0 tempc
+    if command -v sensors >/dev/null 2>&1; then
+        tempc=$(sensors 2>/dev/null | grep -m1 -oE '[0-9]+\.[0-9]+°C' | grep -oE '^[0-9]+' | head -1)
+        [[ -n "$tempc" ]] && tempv=$tempc
+    elif compgen -G "/sys/class/thermal/thermal_zone*/temp" >/dev/null; then
+        local tz tv
+        for tz in /sys/class/thermal/thermal_zone*/temp; do
+            tv=$(cat "$tz" 2>/dev/null)
+            (( tv > tempv )) && tempv=$((tv / 1000))
+        done
+    fi
+    echo -e "   ${DIM}   Máxima registrada: ${tempv:-0}°C${RESET}"
+
+    echo -e "${BOLD}▸ Servicios fallidos:${RESET}"
+    local fall
+    fall=$(systemctl --failed --no-legend --plain 2>/dev/null | wc -l)
+    echo -e "   ${DIM}   ${fall:-0} servicio(s) fallido(s)${RESET}"
+
+    echo -e "${BOLD}▸ Actualizaciones pendientes:${RESET}"
+    case "$(detectar_pkg_manager)" in
+        pacman) echo -e "   ${DIM}   $(pacman -Qu 2>/dev/null | wc -l) paquete(s) con actualización disponible${RESET}" ;;
+        *)      echo -e "   ${DIM}   n/d${RESET}" ;;
+    esac
+
+    echo ""
+    echo -e "${YELLOW}════════════════════════════════════════════════════════════${RESET}"
+    echo -e "${GREEN}✔  Diagnóstico finalizado${RESET}"
+    echo -e "${YELLOW}════════════════════════════════════════════════════════════${RESET}"
+    registrar_ultima_accion "Diagnóstico integral de estabilidad"
+    pause
+}
+
+# ═══════════════════════════════════════════════════════
 #  MENÚ PRINCIPAL
 # ═══════════════════════════════════════════════════════
 menu() {
@@ -3120,7 +3674,8 @@ ${CYAN}${BOLD} ──── EXTRAS ───────────────
         echo -e "${CYAN}${BOLD} ──── KYRO ───────────────────────────────────────────────${RESET}"
         echo -e "${CYAN}19)${RESET} Actualizaciones (auto)                             ${CYAN}20)${RESET} Ver README"
         echo -e "${CYAN}22)${RESET} Chequeo de salud completo                          ${CYAN}23)${RESET} Limpieza profunda"
-        echo -e "${CYAN}25)${RESET} Restaurar ajustes de Kyro (rollback)"
+        echo -e "${CYAN}25)${RESET} Restaurar ajustes de Kyro (rollback)               ${CYAN}26)${RESET} Estabilizador"
+        echo -e "${CYAN}27)${RESET} Reparador de paquetes                             ${CYAN}28)${RESET} Diag. estabilidad"
 
         echo -e "${CYAN} ───────────────────────────────────────────────────────────${RESET}"
         echo -e "${CYAN} S)${RESET} Resumen del sistema                    ${RED}0)${RESET} Salir"
@@ -3154,6 +3709,9 @@ ${CYAN}${BOLD} ──── EXTRAS ───────────────
             23) limpieza_profunda ;;
             24) optimizar_juegos ;;
             25) restaurar_optimizacion ;;
+            26) estabilizador ;;
+            27) reparar_paquetes ;;
+            28) diagnostico_estabilidad ;;
             [Ss]) system_box ;;
             0|q|Q) exit 0 ;;
             *) echo -e "${RED}Opción inválida${RESET}"; sleep 1 ;;
