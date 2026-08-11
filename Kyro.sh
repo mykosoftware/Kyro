@@ -3,11 +3,11 @@
 # ═══════════════════════════════════════════════════════
 #  Kyro Optimizer – Mantenimiento y diagnóstico del sistema
 #  Licencia: GPL-3.0
-#  Versión: 4.21
+#  Versión: 4.3
 # ═══════════════════════════════════════════════════════
 
 set -uo pipefail
-VERSION="4.21"
+VERSION="4.3"
 
 # ─── Colores ───────────────────────────────────────────
 CYAN="\e[36m"
@@ -34,7 +34,6 @@ README_PATH="$SCRIPT_DIR/README.md"
 UPDATE_AVAILABLE=""
 UPDATE_STATE_FILE="$HOME/.cache/kyro_update"
 
-# URL del script en el repositorio.
 UPDATE_URL="${UPDATE_URL:-https://raw.githubusercontent.com/mykosoftware/Kyro/main/Kyro.sh}"
 
 # ─── Utilidades ────────────────────────────────────────
@@ -71,6 +70,7 @@ PROTEGER_RUTAS=(
     "$HOME/GameHub"
 )
 
+# Uso: if ruta_protegida "$dir"; then ... no tocar ...; fi
 ruta_protegida() {
     local r="$1" p pp rp m mm
     rp=$(readlink -f "$r" 2>/dev/null || echo "$r")
@@ -263,6 +263,7 @@ header() {
     echo -e "${GREEN}  ████   █  █  ${GRAY} \  \        /  /      ${RESET}"
     echo -e "${GREEN}  █  █   █  █  ${GRAY}  '------------'       ${RESET}"
     echo -e "${GREEN}  █   █  ████  ${GRAY}.----------------.     ${RESET}"
+    echo -e "               ${GRAY}(__________________)    ${RESET}"
 
     echo -e "${CYAN}
         Kyro Optimizer v${VERSION}
@@ -600,60 +601,79 @@ truncate_path() {
     echo "$path"
 }
 
+# ¿La ruta contiene algún componente oculto (cat. ~/.config, ~/.local, ~/.mozilla)?
+# Esas zonas guardan configuraciones y perfiles de aplicaciones (extensiones del
+# navegador, escritorio, etc.) y NUNCA deben entrar en limpiezas de vacíos.
+ruta_con_oculto() {
+    [[ "$1" == *"/."* ]]
+}
+
+# 8) Buscar directorios vacíos en HOME.
+# Seguridad: solo toca directorios vacíos en zonas VISIBLES (sin componentes
+# ocultos). Los perfiles de navegador, .config, .local, .cache y Wine/Proton
+# quedan siempre fuera del escaneo, aunque estén vacíos en ese momento.
 directorios_vacios() {
     echo -e "${YELLOW}Analizando directorios vacíos en HOME...${RESET}"
 
-    local tmpfile
+    local tmpfile tmpfiltro
     tmpfile=$(mktemp)
+    tmpfiltro=$(mktemp)
     spinner "Buscando directorios vacíos" bash -c "find \"$HOME\" -maxdepth 5 -type d -empty 2>/dev/null > \"$tmpfile\""
-    # Nunca se tocarán directorios de Wine/Proton ni herramientas de compatibilidad.
-    local protegidos
+    # Nunca se tocarán directorios de Wine/Proton, rutas ocultas de
+    # configuración y perfiles de aplicaciones/extensiones.
+    local protegidos ocultos
     protegidos=0
+    ocultos=0
     while IFS= read -r dir; do
+        [[ -n "$dir" ]] || continue
         if ruta_protegida "$dir"; then
             protegidos=$((protegidos + 1))
+            continue
         fi
+        if ruta_con_oculto "$dir"; then
+            ocultos=$((ocultos + 1))
+            continue
+        fi
+        echo "$dir" >> "$tmpfiltro"
     done < "$tmpfile"
     local total
-    total=$(wc -l < "$tmpfile")
+    total=$(wc -l < "$tmpfiltro")
 
     if [[ "$total" -eq 0 ]]; then
-        echo -e "       ${GREEN}✔ No se encontraron directorios vacíos${RESET}"
-        if (( protegidos > 0 )); then
-            echo -e "       ${YELLOW}⚠ Se omitieron ${protegidos} directorio(s) protegido(s) (Wine/Proton).${RESET}"
+        echo -e "       ${GREEN}✔ No se encontraron directorios vacíos en zonas visibles.${RESET}"
+        if (( protegidos > 0 || ocultos > 0 )); then
+            echo -e "       ${YELLOW}⚠ Se omitieron ${protegidos} protegido(s) (Wine/Proton) y ${ocultos} de configuración/perfiles.${RESET}"
         fi
     else
-        printf "       ${YELLOW}📁 Directorios vacíos: %3d${RESET}\n" "$total"
-        if (( protegidos > 0 )); then
-            echo -e "       ${DIM}      (${protegidos} directorio(s) de compatibilidad protegido(s) y omitido(s))${RESET}"
+        printf "       ${YELLOW}📁 Directorios vacíos (zonas visibles): %3d${RESET}\n" "$total"
+        if (( protegidos > 0 || ocultos > 0 )); then
+            echo -e "       ${DIM}      (${protegidos} de compatibilidad y ${ocultos} de configuración/perfiles omitidos)${RESET}"
         fi
-        printf "       ${YELLOW}   (mostrando primeros 5)${RESET}\n"
-        head -5 "$tmpfile" | while IFS= read -r dir; do
-            local short
-            short=$(truncate_path "$dir")
-            printf "       %s\n" "$short"
-        done
-        if [[ "$total" -gt 5 ]]; then
-            printf "       ... y %3d más ...\n" $((total - 5))
-        fi
+        printf "       ${YELLOW}   (mostrando todos)${RESET}\n"
+        while IFS= read -r dir; do
+            [[ -n "$dir" ]] || continue
+            printf "       %s\n" "$(truncate_path "$dir")"
+        done < "$tmpfiltro"
     fi
 
     if [[ "$total" -gt 0 ]]; then
         echo ""
-        if confirmar "¿Deseas eliminar todos los directorios vacíos encontrados?"; then
+        if confirmar "¿Deseas eliminar todos los directorios visibles listados arriba (${total})?"; then
             progress_bar "Eliminando directorios vacíos" 1.5
             local eliminados=0
             while IFS= read -r dir; do
-                if ruta_protegida "$dir"; then
+                [[ -n "$dir" ]] || continue
+                # Doble comprobación: nada de rutas protegidas ni ocultas.
+                if ruta_protegida "$dir" || ruta_con_oculto "$dir"; then
                     continue
                 fi
                 if rmdir "$dir" 2>/dev/null; then
                     eliminados=$((eliminados + 1))
                 fi
-            done < "$tmpfile"
+            done < "$tmpfiltro"
             echo -e "${GREEN}✔ Se eliminaron ${eliminados} de ${total} directorios vacíos${RESET}"
-            if (( protegidos > 0 )); then
-                echo -e "${YELLOW}   ${protegidos} directorio(s) de Wine/Proton protegido(s).${RESET}"
+            if (( protegidos > 0 || ocultos > 0 )); then
+                echo -e "${YELLOW}   ${protegidos} de Wine/Proton y ${ocultos} de configuración/perfiles quedaron intactos.${RESET}"
             fi
             registrar_ultima_accion "Directorios vacíos eliminados (${eliminados})"
         else
@@ -661,7 +681,7 @@ directorios_vacios() {
         fi
     fi
 
-    rm -f "$tmpfile"
+    rm -f "$tmpfile" "$tmpfiltro"
     pause
 }
 
