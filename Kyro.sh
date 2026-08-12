@@ -3,12 +3,15 @@
 # ═══════════════════════════════════════════════════════
 #  Kyro Optimizer – Mantenimiento y diagnóstico del sistema
 #  Licencia: GPL-3.0
-#  Versión: 5.Lexia
+#  Versión: 5.1.Lexia
 #  By: Myko Software
 # ═══════════════════════════════════════════════════════
 
 set -uo pipefail
-VERSION="5.Lexia"
+
+umask 077
+
+VERSION="5.1.Lexia"
 
 # ─── Colores ───────────────────────────────────────────
 CYAN="\e[36m"
@@ -30,7 +33,10 @@ KYRO_NET=()
 
 # ─── Rutas del script y actualizaciones ────────────────
 SCRIPT_PATH="${BASH_SOURCE[0]}"
-SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+if [[ "$SCRIPT_PATH" != /* ]]; then
+    SCRIPT_PATH="$(cd "$(dirname "$SCRIPT_PATH")" 2>/dev/null && pwd)/$(basename "$SCRIPT_PATH")"
+fi
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" 2>/dev/null && pwd)"
 README_PATH="$SCRIPT_DIR/README.md"
 
 UPDATE_AVAILABLE=""
@@ -39,6 +45,20 @@ UPDATE_STATE_FILE="$HOME/.cache/kyro_update"
 UPDATE_URL="${UPDATE_URL:-https://raw.githubusercontent.com/mykosoftware/Kyro/main/Kyro.sh}"
 
 # ─── Utilidades ────────────────────────────────────────
+command_exists() { command -v "$1" >/dev/null 2>&1; }
+
+require_commands() {
+    local missing=() cmd
+    for cmd in "$@"; do
+        command_exists "$cmd" || missing+=("$cmd")
+    done
+    if (( ${#missing[@]} > 0 )); then
+        echo -e "${RED}[ ERROR ]${RESET} Faltan dependencias: ${missing[*]}" >&2
+        return 1
+    fi
+    return 0
+}
+
 pause() {
     read -rp $'\nPresiona ENTER para continuar...' _ || true
 }
@@ -57,13 +77,13 @@ check_sudo() {
         return 0
     fi
     if ! command -v sudo >/dev/null 2>&1; then
-        echo -e "${RED}✘ sudo no está instalado. No se pueden aplicar cambios de sistema.${RESET}"
+        echo -e "${RED}[ ERROR ] sudo no está instalado. No se pueden aplicar cambios de sistema.${RESET}"
         return 1
     fi
     if ! sudo -n true 2>/dev/null; then
         echo -e "${YELLOW}Se necesita permisos de administrador.${RESET}"
         if ! sudo -v 2>/dev/null; then
-            echo -e "${RED}✘ No se pudo autenticar con sudo. Abortando.${RESET}"
+            echo -e "${RED}[ ERROR ] No se pudo autenticar con sudo. Abortando.${RESET}"
             return 1
         fi
     fi
@@ -75,14 +95,70 @@ check_sudo() {
 # (solo lo usa el modo CLI con --yes). El valor por defecto es seguro.
 AUTO_SI=0
 
+# ─── Gestión de temporales/procesos ───────────────────
+# Todos los temporales de Kyro viven en un directorio privado de ejecución.
+# Esto evita fugas incluso cuando una función usa $(...).
+KYRO_TMP_FILES=()
+KYRO_BG_PIDS=()
+KYRO_SPINNER_PIDS=()
+KYRO_CLEANING=0
+KYRO_TMP_DIR=$(command mktemp -d "${TMPDIR:-/tmp}/kyro.XXXXXXXX") || {
+    echo "Kyro: no se pudo crear el directorio temporal." >&2
+    exit 1
+}
+
+crear_temporal() {
+    command mktemp "$KYRO_TMP_DIR/kyro.XXXXXXXX"
+}
+
+eliminar_temporal() {
+    local f="$1"
+    [[ -z "$f" ]] && return 0
+    rm -f -- "$f" "$f.rc" 2>/dev/null || true
+}
+
+kill_tree() {
+    local pid="$1" child
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+    for child in $(pgrep -P "$pid" 2>/dev/null || true); do
+        kill_tree "$child"
+    done
+    kill -TERM "$pid" 2>/dev/null || true
+}
+
+cleanup() {
+    local rc="$?" f pid
+    [[ "$KYRO_CLEANING" == "1" ]] && return "$rc"
+    KYRO_CLEANING=1
+
+    for pid in "${KYRO_BG_PIDS[@]:-}" "${KYRO_SPINNER_PIDS[@]:-}"; do
+        [[ -n "$pid" && "$pid" != "$$" ]] || continue
+        kill_tree "$pid"
+        wait "$pid" 2>/dev/null || true
+    done
+
+    for f in "${KYRO_TMP_FILES[@]:-}"; do
+        eliminar_temporal "$f"
+    done
+    rm -rf -- "$KYRO_TMP_DIR" 2>/dev/null || true
+
+    restaurar_terminal
+    return "$rc"
+}
 # ─── Seguridad de terminal ─────────────────────────────
 # Si el usuario pulsa Ctrl+C restauramos el cursor (el panel en vivo lo
 # oculta) y salimos limpiamente; evita continuar tras una interrupción.
 restaurar_terminal() {
+    [[ -t 1 ]] || return 0
     tput cnorm 2>/dev/null || true
-    tput cup 0 0 2>/dev/null || true
+    tput sgr0 2>/dev/null || true
+    printf '\r\033[K' 2>/dev/null || true
 }
-trap 'restaurar_terminal; exit 130' INT TERM
+
+# EXIT siempre pasa por cleanup; INT/TERM salen con código 130 y luego
+# disparan EXIT, garantizando restauración de cursor, temporales y procesos.
+trap 'exit 130' INT TERM
+trap 'cleanup' EXIT
 
 # ─── Rutas protegidas: jamás se eliminan ───────────────
 # Wine, Proton y herramientas de compatibilidad (prefijos, prefixs de
@@ -210,37 +286,49 @@ barra_pulso() {
 spinner() {
     local msg="$1"; shift
     local style="${1:-braille}"
-    local frames
+    # El primer parámetro tras el mensaje es estilo solo si coincide con uno.
     case "$style" in
-        dots)    frames="⠂⠁⠂⠄ ⠂" ;;
-        barra)   frames="▏▎▍▌▋▊▉▊▋▌▍▎" ;;
-        puntos)  frames="● ○ ● ○" ;;
-        *)       frames="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏" ;;
+        dots|barra|puntos|braille) shift ;;
+        *) style="braille" ;;
     esac
-    local tmp_out
-    tmp_out=$(mktemp)
+    local -a frames=()
+    case "$style" in
+        dots)    frames=( '⠂' '⠁' '⠂' '⠄' ) ;;
+        barra)   frames=( '▏' '▎' '▍' '▌' '▋' '▊' '▉' '▊' '▋' '▌' '▍' '▎' ) ;;
+        puntos)  frames=( '●' '○' ) ;;
+        *)       frames=( '⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏' ) ;;
+    esac
 
-    ("$@" >"$tmp_out" 2>&1; echo $? > "${tmp_out}.rc") &
-    local pid=$!
+    local tmp_out tmp_rc pid frame i=0 rc=0
+    tmp_out=$(crear_temporal) || { echo -e "${RED}[ ERROR ]${RESET} No se pudo crear temporal para spinner."; return 1; }
+    tmp_rc="${tmp_out}.rc"
 
-    local i=0
+    ( "$@" >"$tmp_out" 2>&1; rc=$?; printf '%s\n' "$rc" >"$tmp_rc" ) &
+    pid=$!
+    KYRO_SPINNER_PIDS+=("$pid")
+
     while kill -0 "$pid" 2>/dev/null; do
-        local frame="${frames:i++%${#frames}:1}"
+        frame="${frames[i % ${#frames[@]}]}"
+        ((i++))
         printf "\r${MAGENTA}%s${RESET} %s " "$frame" "$msg"
-        sleep 0.1
+        sleep 0.10
     done
     wait "$pid" 2>/dev/null || true
+    local -a _remaining=() _p
+    for _p in "${KYRO_SPINNER_PIDS[@]:-}"; do
+        [[ "$_p" != "$pid" ]] && _remaining+=("$_p")
+    done
+    KYRO_SPINNER_PIDS=("${_remaining[@]:-}")
 
-    local rc=0
-    [[ -f "${tmp_out}.rc" ]] && rc=$(cat "${tmp_out}.rc")
-    printf "\r"
+    [[ -s "$tmp_rc" ]] && rc=$(<"$tmp_rc")
+    printf "\r\033[K"
     if [[ "$rc" -eq 0 ]]; then
-        echo -e "${GREEN}✔${RESET} $msg"
+        echo -e "${GREEN}[ OK ]${RESET} $msg"
     else
-        echo -e "${YELLOW}⚠${RESET} $msg ${DIM}(código $rc)${RESET}"
+        echo -e "${RED}[ ERROR ]${RESET} $msg ${DIM}(código $rc)${RESET}"
     fi
-    cat "$tmp_out"
-    rm -f "$tmp_out" "${tmp_out}.rc"
+    cat "$tmp_out" 2>/dev/null || true
+    eliminar_temporal "$tmp_out"
     return "$rc"
 }
 
@@ -547,7 +635,7 @@ eliminar_y_medir() {
             sudo rm -rf "$ruta" 2>/dev/null && rc=0 || rc=1
         fi
         if [[ "${mostrar:-1}" == "1" ]]; then
-            echo -e "   ${GREEN}✔${RESET} $(truncate_path "$ruta")  ${DIM}($(formatear_bytes "$antes"))${RESET}" >&2
+            echo -e "   ${GREEN}[ OK ]${RESET} $(truncate_path "$ruta")  ${DIM}($(formatear_bytes "$antes"))${RESET}" >&2
         fi
     fi
     if [[ "$rc" -eq 0 ]]; then echo "$antes"; else echo 0; fi
@@ -674,7 +762,7 @@ cache() {
         if (( core_old > 0 )); then
             if confirmar "¿Eliminar ${core_old} volcados de memoria (coredumps) de hace más de 7 días?"; then
                 sudo find /var/lib/systemd/coredump -type f -mtime +7 -delete 2>/dev/null
-                echo -e "   ${GREEN}✔ Coredumps antiguos eliminados${RESET}"
+                echo -e "   ${GREEN}[ OK ] Coredumps antiguos eliminados${RESET}"
             fi
         fi
     fi
@@ -697,7 +785,7 @@ cache() {
                     _c=$(echo "$_c" | tr -d '\n')
                     [[ -z "$_c" ]] || eliminar_y_medir "$_c" 0 >/dev/null
                 done
-                echo -e "   ${GREEN}✔ Caché Flatpak vaciada${RESET}"
+                echo -e "   ${GREEN}[ OK ] Caché Flatpak vaciada${RESET}"
             fi
         fi
     fi
@@ -705,7 +793,7 @@ cache() {
     # ── Reporte final (espacio real liberado, suma de cada elemento) ──
     echo ""
     echo -e "${YELLOW}════════════════════════════════════════════════════════════${RESET}"
-    echo -e "${GREEN}✔  Limpieza de caché completada${RESET}"
+    echo -e "${GREEN}[ OK ]  Limpieza de caché completada${RESET}"
     echo -e "${DIM}   Espacio realmente liberado: ${BOLD}${WHITE}$(formatear_bytes "$liberado")${RESET}${DIM}${RESET}"
     echo -e "${YELLOW}════════════════════════════════════════════════════════════${RESET}"
     registrar_ultima_accion "Limpieza de caché todo-en-uno ($(formatear_bytes "$liberado") liberados)"
@@ -725,12 +813,13 @@ paquetes_huerfanos() {
                 echo "$orphans"
                 echo -e "${DIM}Total: $(echo "$orphans" | wc -l) paquete(s)${RESET}"
                 if confirmar "¿Eliminar estos paquetes?"; then
-                    sudo pacman -Rns $orphans
-                    echo -e "${GREEN}✔ Huérfanos eliminados${RESET}"
+                    mapfile -t orphan_pkgs < <(printf '%s\n' "$orphans")
+                    sudo pacman -Rns "${orphan_pkgs[@]}"
+                    echo -e "${GREEN}[ OK ] Huérfanos eliminados${RESET}"
                     registrar_ultima_accion "Huérfanos eliminados (pacman)"
                 fi
             else
-                echo -e "${GREEN}✔ No hay huérfanos${RESET}"
+                echo -e "${GREEN}[ OK ] No hay huérfanos${RESET}"
             fi
             ;;
         apt)
@@ -740,11 +829,11 @@ paquetes_huerfanos() {
                 echo -e "${DIM}Total: $(echo "$orphans" | wc -l) paquete(s)${RESET}"
                 if confirmar "¿Eliminar estos paquetes?"; then
                     sudo apt autoremove --purge -y
-                    echo -e "${GREEN}✔ Huérfanos eliminados${RESET}"
+                    echo -e "${GREEN}[ OK ] Huérfanos eliminados${RESET}"
                     registrar_ultima_accion "Huérfanos eliminados (apt)"
                 fi
             else
-                echo -e "${GREEN}✔ No hay huérfanos${RESET}"
+                echo -e "${GREEN}[ OK ] No hay huérfanos${RESET}"
             fi
             ;;
         dnf)
@@ -753,11 +842,11 @@ paquetes_huerfanos() {
                 echo "$orphans"
                 if confirmar "¿Eliminar estos paquetes?"; then
                     sudo dnf autoremove -y
-                    echo -e "${GREEN}✔ Huérfanos eliminados${RESET}"
+                    echo -e "${GREEN}[ OK ] Huérfanos eliminados${RESET}"
                     registrar_ultima_accion "Huérfanos eliminados (dnf)"
                 fi
             else
-                echo -e "${GREEN}✔ No hay huérfanos${RESET}"
+                echo -e "${GREEN}[ OK ] No hay huérfanos${RESET}"
             fi
             ;;
         zypper)
@@ -766,12 +855,13 @@ paquetes_huerfanos() {
                 echo "$orphans"
                 echo -e "${DIM}Total: $(echo "$orphans" | wc -l) paquete(s)${RESET}"
                 if confirmar "¿Eliminar estos paquetes?"; then
-                    sudo zypper rm $(echo "$orphans")
-                    echo -e "${GREEN}✔ Huérfanos eliminados${RESET}"
+                    mapfile -t zypper_orphans < <(printf '%s\n' "$orphans" | awk 'NF {print $1}')
+                    sudo zypper rm "${zypper_orphans[@]}"
+                    echo -e "${GREEN}[ OK ] Huérfanos eliminados${RESET}"
                     registrar_ultima_accion "Huérfanos eliminados (zypper)"
                 fi
             else
-                echo -e "${GREEN}✔ No hay huérfanos${RESET}"
+                echo -e "${GREEN}[ OK ] No hay huérfanos${RESET}"
             fi
             ;;
         *)
@@ -798,15 +888,15 @@ logs() {
     sudo journalctl --rotate 2>/dev/null || true
     spinner "Reduciendo logs a 7 días" sudo journalctl --vacuum-time=7d
     despues=$(sudo journalctl --disk-usage 2>/dev/null | grep -oE '[0-9.]+[KMG]' | head -1 || echo "0")
-    echo -e "${GREEN}✔ Logs del sistema reducidos (7 días)${RESET}"
+    echo -e "${GREEN}[ OK ] Logs del sistema reducidos (7 días)${RESET}"
     echo -e "${DIM}   Uso antes: ${antes}  →  Uso ahora: ${despues}${RESET}"
     if confirmar "¿Limitar también el journal a 300 MB en disco (evita crecimientos futuros)?"; then
         if ! grep -q '^SystemMaxUse' /etc/systemd/journald.conf 2>/dev/null; then
             echo -e "SystemMaxUse=300M\nSystemKeepFree=100M" | sudo tee -a /etc/systemd/journald.conf >/dev/null 2>&1
             sudo systemctl restart systemd-journald 2>/dev/null || sudo journalctl --flush 2>/dev/null
-            echo -e "   ${GREEN}✔ Journal limitado a 300 MB (persistente)${RESET}"
+            echo -e "   ${GREEN}[ OK ] Journal limitado a 300 MB (persistente)${RESET}"
         else
-            echo -e "   ${YELLOW}⚠ El journal ya tiene un límite definido.${RESET}"
+            echo -e "   ${YELLOW}[ WARN ] El journal ya tiene un límite definido.${RESET}"
         fi
     fi
     registrar_ultima_accion "Logs reducidos a 7 días"
@@ -822,7 +912,7 @@ papelera() {
         if confirmar "¿Vaciar papelera?"; then
             progress_bar "Vaciando papelera" 1.5
             rm -rf "${TRASH:?}"/* "${TRASH:?}"/.[!.]* 2>/dev/null || true
-            echo -e "${GREEN}✔ Papelera vaciada${RESET} ${DIM}(${tamano} liberados)${RESET}"
+            echo -e "${GREEN}[ OK ] Papelera vaciada${RESET} ${DIM}(${tamano} liberados)${RESET}"
             registrar_ultima_accion "Papelera vaciada (${tamano} liberados)"
         fi
     else
@@ -857,8 +947,8 @@ directorios_vacios() {
     echo -e "${YELLOW}Analizando directorios vacíos en HOME...${RESET}"
 
     local tmpfile tmpfiltro
-    tmpfile=$(mktemp)
-    tmpfiltro=$(mktemp)
+    tmpfile=$(crear_temporal)
+    tmpfiltro=$(crear_temporal)
     spinner "Buscando directorios vacíos" bash -c "find \"$HOME\" -maxdepth 5 -type d -empty 2>/dev/null > \"$tmpfile\""
     # Nunca se tocarán directorios de Wine/Proton, rutas ocultas de
     # configuración y perfiles de aplicaciones/extensiones.
@@ -881,9 +971,9 @@ directorios_vacios() {
     total=$(wc -l < "$tmpfiltro")
 
     if [[ "$total" -eq 0 ]]; then
-        echo -e "       ${GREEN}✔ No se encontraron directorios vacíos en zonas visibles.${RESET}"
+        echo -e "       ${GREEN}[ OK ] No se encontraron directorios vacíos en zonas visibles.${RESET}"
         if (( protegidos > 0 || ocultos > 0 )); then
-            echo -e "       ${YELLOW}⚠ Se omitieron ${protegidos} protegido(s) (Wine/Proton) y ${ocultos} de configuración/perfiles.${RESET}"
+            echo -e "       ${YELLOW}[ WARN ] Se omitieron ${protegidos} protegido(s) (Wine/Proton) y ${ocultos} de configuración/perfiles.${RESET}"
         fi
     else
         printf "       ${YELLOW}📁 Directorios vacíos (zonas visibles): %3d${RESET}\n" "$total"
@@ -912,7 +1002,7 @@ directorios_vacios() {
                     eliminados=$((eliminados + 1))
                 fi
             done < "$tmpfiltro"
-            echo -e "${GREEN}✔ Se eliminaron ${eliminados} de ${total} directorios vacíos${RESET}"
+            echo -e "${GREEN}[ OK ] Se eliminaron ${eliminados} de ${total} directorios vacíos${RESET}"
             if (( protegidos > 0 || ocultos > 0 )); then
                 echo -e "${YELLOW}   ${protegidos} de Wine/Proton y ${ocultos} de configuración/perfiles quedaron intactos.${RESET}"
             fi
@@ -1051,7 +1141,7 @@ crear_archivo_swap() {
     local tam_real=0
     [[ -f "$candidato" ]] && tam_real=$(( $(stat -c %s "$candidato" 2>/dev/null || echo 0) / 1048576 ))
     if [[ "$creado" -ne 0 ]] || [[ ! -f "$candidato" ]] || (( tam_real < tamano_mb )); then
-        echo -e "${RED}✘ No se pudo crear el archivo de swap en $candidato${RESET}"
+        echo -e "${RED}[ ERROR ] No se pudo crear el archivo de swap en $candidato${RESET}"
         sudo rm -f "$candidato" 2>/dev/null || true
         return 1
     fi
@@ -1070,11 +1160,11 @@ crear_archivo_swap() {
         unidad=$(systemd-escape -p --suffix=swap "$candidato")
         sudo systemctl reset-failed "$unidad" >/dev/null 2>&1 || true
         sudo systemctl start "$unidad" >/dev/null 2>&1 || sudo swapon -a >/dev/null 2>&1
-        echo -e "${GREEN}✔ Swap creado y activado en $candidato (${tamano_mb} MB, $fs)${RESET}"
+        echo -e "${GREEN}[ OK ] Swap creado y activado en $candidato (${tamano_mb} MB, $fs)${RESET}"
         registrar_ultima_accion "Swap ampliado +${tamano_mb} MB en $candidato"
         return 0
     else
-        echo -e "${RED}✘ swapon falló para $candidato (fs: $fs, compresión/COW activa?)${RESET}"
+        echo -e "${RED}[ ERROR ] swapon falló para $candidato (fs: $fs, compresión/COW activa?)${RESET}"
         return 1
     fi
 }
@@ -1312,7 +1402,7 @@ optimizar_hardware() {
         echo -e "${CYAN}│${RESET} ${ORANGE}◐${RESET} Se hallaron ${BOLD}${err_total}${RESET} evento(s) con aspecto de error en el kernel."
         echo -e "${CYAN}│${RESET} ${DIM}Pueden ser benignos; usa la opción 7 para clasificarlos.${RESET}"
     else
-        echo -e "${CYAN}│${RESET} ${GREEN}✔${RESET} Sin errores críticos de hardware detectados recientemente."
+        echo -e "${CYAN}│${RESET} ${GREEN}[ OK ]${RESET} Sin errores críticos de hardware detectados recientemente."
     fi
     echo -e "${CYAN}╰──────────────────────────────────────────────────────────────────╯${RESET}"
 
@@ -1346,10 +1436,10 @@ optimizar_hardware() {
         local cv="$1" sum=""
         if sudo sysctl -w "$cv" >/dev/null 2>&1; then
             ajustes+=("$cv")
-            echo -e "   ${GREEN}✔${RESET} $cv"
+            echo -e "   ${GREEN}[ OK ]${RESET} $cv"
             return 0
         fi
-        echo -e "   ${YELLOW}⚠${RESET} $cv (no aplicable)"
+        echo -e "   ${YELLOW}[ WARN ]${RESET} $cv (no aplicable)"
         return 1
     }
 
@@ -1380,9 +1470,9 @@ optimizar_hardware() {
                 echo "$governor_rec" | sudo tee "$gpath" >/dev/null 2>&1 || ok=0
             done
             if [[ "$ok" -eq 1 ]]; then
-                echo -e "${GREEN}✔ Gobernador aplicado${RESET}"
+                echo -e "${GREEN}[ OK ] Gobernador aplicado${RESET}"
             else
-                echo -e "${YELLOW}⚠ No se pudo aplicar en todos los núcleos${RESET}"
+                echo -e "${YELLOW}[ WARN ] No se pudo aplicar en todos los núcleos${RESET}"
             fi
             if confirmar "    → ¿Persistir tras reiniciar con un servicio systemd?"; then
                 persistir_optimizacion "$governor_rec" "$sched_rec" "$base_dev"
@@ -1396,9 +1486,9 @@ optimizar_hardware() {
     if [[ -f "/sys/block/$base_dev/queue/scheduler" ]]; then
         if confirmar "  → ¿Aplicar planificador de E/S '${sched_rec}' a /dev/${base_dev}?"; then
             if echo "$sched_rec" | sudo tee "/sys/block/$base_dev/queue/scheduler" >/dev/null 2>&1; then
-                echo -e "${GREEN}✔ Planificador aplicado${RESET}"
+                echo -e "${GREEN}[ OK ] Planificador aplicado${RESET}"
             else
-                echo -e "${RED}✘ No se pudo aplicar ('${sched_rec}' puede no estar disponible en este disco)${RESET}"
+                echo -e "${RED}[ ERROR ] No se pudo aplicar ('${sched_rec}' puede no estar disponible en este disco)${RESET}"
             fi
         fi
     fi
@@ -1412,7 +1502,7 @@ optimizar_hardware() {
             crear_archivo_swap "$deficit"
         fi
     elif (( swap_total > 0 )); then
-        echo -e "${GREEN}✔ Tu swap actual ya es adecuado para tu RAM${RESET}"
+        echo -e "${GREEN}[ OK ] Tu swap actual ya es adecuado para tu RAM${RESET}"
     fi
 
     registrar_ultima_accion "Optimización de hardware (${tipo_disco}, ${ram_gb} GiB RAM, perfil ${perfil})"
@@ -1452,8 +1542,8 @@ WantedBy=multi-user.target
 EOF
     sudo systemctl daemon-reload >/dev/null 2>&1
     sudo systemctl enable --now kyro-perf.service >/dev/null 2>&1 && \
-        echo -e "${GREEN}✔ Servicio kyro-perf activado y persistente en cada arranque${RESET}" || \
-        echo -e "${YELLOW}⚠ No se pudo activar el servicio (systemd no disponible?)${RESET}"
+        echo -e "${GREEN}[ OK ] Servicio kyro-perf activado y persistente en cada arranque${RESET}" || \
+        echo -e "${YELLOW}[ WARN ] No se pudo activar el servicio (systemd no disponible?)${RESET}"
 }
 
 # ═══════════════════════════════════════════════════════
@@ -1485,7 +1575,7 @@ errores_hardware() {
     if [[ -n "$kernel_src" ]]; then
         echo "$kernel_src"
     else
-        echo -e "   ${GREEN}✔ No se encontraron eventos recientes del kernel.${RESET}"
+        echo -e "   ${GREEN}[ OK ] No se encontraron eventos recientes del kernel.${RESET}"
     fi
     echo ""
 
@@ -1505,9 +1595,9 @@ errores_hardware() {
             t=$(sudo smartctl -A /dev/"$d" 2>/dev/null | awk '/Temperature_Celsius/{print $10; exit}')
             echo -n "      /dev/$d "
             if echo "$h" | grep -qi 'passed'; then
-                printf "${GREEN}✔ Sano${RESET}"
+                printf "${GREEN}[ OK ] Sano${RESET}"
             elif echo "$h" | grep -qi 'failed'; then
-                printf "${RED}✘ FALLO detectado${RESET}"
+                printf "${RED}[ ERROR ] FALLO detectado${RESET}"
             else
                 printf "${YELLOW}sin datos SMART${RESET}"
             fi
@@ -1540,7 +1630,7 @@ errores_hardware() {
         sudo edac-util --report 2>/dev/null | head -10
     fi
     if (( hay_nvme_err == 0 )) && (( hay_mem_err == 0 )); then
-        echo -e "   ${GREEN}✔ Sin errores NVMe ni de memoria detectados recientemente.${RESET}"
+        echo -e "   ${GREEN}[ OK ] Sin errores NVMe ni de memoria detectados recientemente.${RESET}"
     fi
     echo ""
 
@@ -1593,19 +1683,19 @@ errores_hardware() {
     fi
 
     if [[ -n "$senales_fuertes" ]] || [[ -n "$smart_fallido" ]]; then
-        echo -e "   ${RED}⚠ Hay señales de posible fallo de hardware.${RESET}"
+        echo -e "   ${RED}[ WARN ] Hay señales de posible fallo de hardware.${RESET}"
         [[ -n "$smart_fallido" ]] && echo -e "      ${RED}S.M.A.R.T.: ${smart_fallido} reporta FALLO de salud.${RESET}"
         [[ -n "$senales_fuertes" ]] && echo -e "      ${DIM}Eventos:${RESET}" && printf '      %s\n' "$senales_fuertes"
         echo -e "   ${DIM}Si persisten, revisa RAM (memtest86+), alimentación y discos.${RESET}"
     elif [[ -n "$senales_debiles" ]]; then
-        echo -e "   ${YELLOW}⚠ Hay eventos con aspecto de error, pero pueden ser no problemáticos.${RESET}"
+        echo -e "   ${YELLOW}[ WARN ] Hay eventos con aspecto de error, pero pueden ser no problemáticos.${RESET}"
         echo -e "   ${YELLOW}No se puede asegurar con certeza que exista un fallo real.${RESET}"
         echo -e "   ${DIM}Para confirmar o descartar, haz un análisis a profundidad A.${RESET}"
         if confirmar "→ Realizar análisis a profundidad de los eventos detectados?"; then
             analizar_a_fondo_errores
         fi
     else
-        echo -e "   ${GREEN}✔ Sin señales de fallo de hardware.${RESET}"
+        echo -e "   ${GREEN}[ OK ] Sin señales de fallo de hardware.${RESET}"
     fi
     registrar_ultima_accion "Diagnóstico de errores de hardware"
     pause
@@ -1672,11 +1762,11 @@ analizar_a_fondo_errores() {
 aplicar_sysctl() {
     local clave="$1" valor="$2"
     if sudo sysctl -w "$clave=$valor" >/dev/null 2>&1; then
-        echo -e "   ${GREEN}✔${RESET} $clave = $valor"
+        echo -e "   ${GREEN}[ OK ]${RESET} $clave = $valor"
         KYRO_SYSCTL+=("$clave=$valor")
         return 0
     fi
-    echo -e "   ${YELLOW}⚠${RESET} $clave (no aplicable)"
+    echo -e "   ${YELLOW}[ WARN ]${RESET} $clave (no aplicable)"
     return 1
 }
 
@@ -1686,10 +1776,10 @@ guardar_sysctls() {
     local elem lista=""
     for elem in "$@"; do lista+="$elem"$'\n'; done
     if printf '%s' "$lista" | sudo tee "/etc/sysctl.d/$archivo" >/dev/null 2>&1; then
-        echo -e "   ${GREEN}✔ Guardado en /etc/sysctl.d/$archivo${RESET}"
+        echo -e "   ${GREEN}[ OK ] Guardado en /etc/sysctl.d/$archivo${RESET}"
         return 0
     fi
-    echo -e "   ${YELLOW}⚠ No se pudo guardar la persistencia.${RESET}"
+    echo -e "   ${YELLOW}[ WARN ] No se pudo guardar la persistencia.${RESET}"
     return 1
 }
 
@@ -1752,7 +1842,7 @@ optimizacion_rapida() {
     for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
         [[ -f "$g" ]] && echo "$gov" | sudo tee "$g" >/dev/null 2>&1 && govok=1
     done
-    [[ "$govok" -eq 1 ]] && echo -e "   ${GREEN}✔${RESET}" || echo -e "   ${YELLOW}⚠ sin cpufreq (se omite)${RESET}"
+    [[ "$govok" -eq 1 ]] && echo -e "   ${GREEN}[ OK ]${RESET}" || echo -e "   ${YELLOW}[ WARN ] sin cpufreq (se omite)${RESET}"
     echo ""
 
     # ── Planificador E/S en todos los discos ──
@@ -1764,7 +1854,7 @@ optimizacion_rapida() {
             echo "$sched_rec" | sudo tee "$q" >/dev/null 2>&1 && sched_ok=1
         fi
     done
-    [[ "$sched_ok" -eq 1 ]] && echo -e "   ${GREEN}✔ aplicado${RESET}" || echo -e "   ${YELLOW}⚠ sin discos ajustables${RESET}"
+    [[ "$sched_ok" -eq 1 ]] && echo -e "   ${GREEN}[ OK ] aplicado${RESET}" || echo -e "   ${YELLOW}[ WARN ] sin discos ajustables${RESET}"
     echo ""
 
     # ── Persistencia ──
@@ -1777,7 +1867,7 @@ optimizacion_rapida() {
 
     registrar_ultima_accion "Optimización rápida ($tipo_disco, gov=$gov, swappiness=$sw)"
     echo ""
-    echo -e "${GREEN}✔ Optimización rápida finalizada${RESET}"
+    echo -e "${GREEN}[ OK ] Optimización rápida finalizada${RESET}"
     pause
 }
 
@@ -1787,7 +1877,7 @@ persistir_ajustes_rapidos() {
     local bin="/usr/local/bin/kyro-quick-apply.sh"
     local svc="/etc/systemd/system/kyro-quick.service"
     local tmpbin l
-    tmpbin=$(mktemp)
+    tmpbin=$(crear_temporal)
 
     cat > "$tmpbin" <<EOF
 #!/bin/bash
@@ -1821,15 +1911,15 @@ WantedBy=multi-user.target
 EOF
         sudo systemctl daemon-reload >/dev/null 2>&1
         if sudo systemctl enable --now kyro-quick.service >/dev/null 2>&1; then
-            echo -e "   ${GREEN}✔ Ajustes persistentes (kyro-quick.service)${RESET}"
+            echo -e "   ${GREEN}[ OK ] Ajustes persistentes (kyro-quick.service)${RESET}"
         else
-            echo -e "   ${YELLOW}⚠ Script guardado, pero no se pudo activar el servicio.${RESET}"
+            echo -e "   ${YELLOW}[ WARN ] Script guardado, pero no se pudo activar el servicio.${RESET}"
         fi
         rm -f "$tmpbin"
         return 0
     fi
     rm -f "$tmpbin"
-    echo -e "   ${RED}✘ No se pudo escribir el script persistente (¿sudo?).${RESET}"
+    echo -e "   ${RED}[ ERROR ] No se pudo escribir el script persistente (¿sudo?).${RESET}"
     return 1
 }
 
@@ -1980,7 +2070,7 @@ limpiar_caches_apps() {
     despues=$(( despues + $(tamano_de "$HOME/.var/app") ))
     liberado=$(( antes - despues ))
     (( liberado < 0 )) && liberado=0
-    echo -e "${GREEN}✔ Cachés de aplicaciones limpias${RESET}  ${DIM}($(formatear_bytes "$liberado") liberados)${RESET}"
+    echo -e "${GREEN}[ OK ] Cachés de aplicaciones limpias${RESET}  ${DIM}($(formatear_bytes "$liberado") liberados)${RESET}"
     registrar_ultima_accion "Limpieza de cachés de apps ($(formatear_bytes "$liberado"))"
     pause
 }
@@ -2014,7 +2104,7 @@ refrescar_repos() {
             echo -e "${YELLOW}Gestor de paquetes no soportado.${RESET}"
             ;;
     esac
-    echo -e "${GREEN}✔ Repositorios sincronizados${RESET}"
+    echo -e "${GREEN}[ OK ] Repositorios sincronizados${RESET}"
     registrar_ultima_accion "Sincronización de repositorios"
     pause
 }
@@ -2025,7 +2115,7 @@ limpiar_kernels_viejos() {
     local kpkg okg activo
     kpkg=$(pacman -Qq 2>/dev/null | grep -E '^(linux)' | grep -Ev 'firmware|api-headers' | sort)
     if [[ -z "$kpkg" ]]; then
-        echo -e "${GREEN}✔ No se detectaron paquetes de kernel.${RESET}"
+        echo -e "${GREEN}[ OK ] No se detectaron paquetes de kernel.${RESET}"
         pause
         return 0
     fi
@@ -2064,7 +2154,7 @@ limpiar_kernels_viejos() {
     fi
     if confirmar "¿Eliminar ${quitar[*]}?"; then
         sudo pacman -Rns --noconfirm "${quitar[@]}"
-        echo -e "${GREEN}✔ Kernels eliminados. El cargador se regenera solo en el arranque.${RESET}"
+        echo -e "${GREEN}[ OK ] Kernels eliminados. El cargador se regenera solo en el arranque.${RESET}"
         registrar_ultima_accion "Limpieza de kernels viejos (${#quitar[@]})"
     fi
     pause
@@ -2074,14 +2164,14 @@ limpiar_kernels_viejos() {
 revisar_pacnew() {
     echo -e "${YELLOW}Buscando archivos .pacnew / .pacsave en /etc...${RESET}"
     local tmpfile
-    tmpfile=$(mktemp)
+    tmpfile=$(crear_temporal)
     find /etc -type f \( -name '*.pacnew' -o -name '*.pacsave' \) 2>/dev/null | sort > "$tmpfile"
     local total
     total=$(wc -l < "$tmpfile" 2>/dev/null || echo 0)
     if [[ "$total" -eq 0 ]]; then
-        echo -e "${GREEN}✔ No hay archivos .pacnew ni .pacsave${RESET}"
+        echo -e "${GREEN}[ OK ] No hay archivos .pacnew ni .pacsave${RESET}"
     else
-        echo -e "${YELLOW}⚠ ${total} archivo(s) pendientes de revisar:${RESET}"
+        echo -e "${YELLOW}[ WARN ] ${total} archivo(s) pendientes de revisar:${RESET}"
         while IFS= read -r f; do
             [[ -z "$f" ]] && continue
             local sz fecha
@@ -2108,7 +2198,7 @@ revisar_pacnew() {
                             ;;
                         a)
                             sudo cp -a "$b" "$b.pacsave" 2>/dev/null || true
-                            sudo cp -a "$f" "$b" 2>/dev/null && echo -e "   ${GREEN}✔ ${b} actualizado (backup: ${b}.pacsave)${RESET}"
+                            sudo cp -a "$f" "$b" 2>/dev/null && echo -e "   ${GREEN}[ OK ] ${b} actualizado (backup: ${b}.pacsave)${RESET}"
                             aplicados=$((aplicados + 1))
                             break
                             ;;
@@ -2128,7 +2218,7 @@ revisar_pacnew() {
                 done
                 if [[ "$decidir_todos" -eq 1 ]]; then
                     sudo cp -a "$b" "$b.pacsave" 2>/dev/null || true
-                    sudo cp -a "$f" "$b" 2>/dev/null && echo -e "   ${GREEN}✔ ${b} actualizado (todos)${RESET}"
+                    sudo cp -a "$f" "$b" 2>/dev/null && echo -e "   ${GREEN}[ OK ] ${b} actualizado (todos)${RESET}"
                     aplicados=$((aplicados + 1))
                 fi
             else
@@ -2142,7 +2232,7 @@ revisar_pacnew() {
                             ver_diff_pacnew "$f" "$b"
                             ;;
                         r)
-                            sudo cp -a "$f" "$b" 2>/dev/null && echo -e "   ${GREEN}✔ ${b} restaurado desde el backup${RESET}"
+                            sudo cp -a "$f" "$b" 2>/dev/null && echo -e "   ${GREEN}[ OK ] ${b} restaurado desde el backup${RESET}"
                             aplicados=$((aplicados + 1))
                             break
                             ;;
@@ -2161,7 +2251,7 @@ revisar_pacnew() {
                     esac
                 done
                 if [[ "$decidir_todos" -eq 1 ]]; then
-                    sudo cp -a "$f" "$b" 2>/dev/null && echo -e "   ${GREEN}✔ ${b} restaurado (todos)${RESET}"
+                    sudo cp -a "$f" "$b" 2>/dev/null && echo -e "   ${GREEN}[ OK ] ${b} restaurado (todos)${RESET}"
                     aplicados=$((aplicados + 1))
                 fi
             fi
@@ -2212,18 +2302,18 @@ diagnostico_red() {
         resolvectl status 2>/dev/null | head -n 12 || true
         if confirmar "¿Vaciar caché de DNS?"; then
             sudo resolvectl flush-caches
-            echo -e "${GREEN}✔ Caché DNS vaciada${RESET}"
+            echo -e "${GREEN}[ OK ] Caché DNS vaciada${RESET}"
         fi
     fi
     if command -v nmcli >/dev/null 2>&1; then
         if nmcli -t -f RUNNING general 2>/dev/null | grep -q running; then
-            echo -e "${GREEN}✔ NetworkManager ejecutándose${RESET}"
+            echo -e "${GREEN}[ OK ] NetworkManager ejecutándose${RESET}"
         else
             echo -e "${YELLOW}NetworkManager no se está ejecutando.${RESET}"
         fi
         if confirmar "¿Reiniciar NetworkManager?"; then
             sudo systemctl restart NetworkManager
-            echo -e "${GREEN}✔ NetworkManager reiniciado${RESET}"
+            echo -e "${GREEN}[ OK ] NetworkManager reiniciado${RESET}"
         fi
     fi
     if command -v ping >/dev/null 2>&1; then
@@ -2273,7 +2363,7 @@ corrupcion() {
     echo -e "${YELLOW}Revisando integridad de paquetes...${RESET}"
     local pkg tmpfile disponible rc_verif
     pkg=$(detectar_pkg_manager)
-    tmpfile=$(mktemp)
+    tmpfile=$(crear_temporal)
     disponible=1
     rc_verif=0
 
@@ -2327,9 +2417,9 @@ corrupcion() {
         total=${total:-0}
 
         if [[ "$total" -eq 0 ]]; then
-            echo -e "${GREEN}✔ No se encontraron paquetes ni archivos corruptos${RESET}"
+            echo -e "${GREEN}[ OK ] No se encontraron paquetes ni archivos corruptos${RESET}"
         else
-            echo -e "${YELLOW}⚠ Se encontraron ${total} paquete(s)/archivo(s) con problemas de integridad${RESET}"
+            echo -e "${YELLOW}[ WARN ] Se encontraron ${total} paquete(s)/archivo(s) con problemas de integridad${RESET}"
             if confirmar "¿Ver el detalle?"; then
                 echo ""
                 cat "$tmpfile"
@@ -2339,7 +2429,7 @@ corrupcion() {
         fi
         registrar_ultima_accion "Verificación de integridad (${total} problema(s))"
     elif (( rc_verif != 0 )); then
-        echo -e "${YELLOW}⚠ No se pudo completar la verificación (faltan permisos sudo o el gestor falla).${RESET}"
+        echo -e "${YELLOW}[ WARN ] No se pudo completar la verificación (faltan permisos sudo o el gestor falla).${RESET}"
     fi
 
     rm -f "$tmpfile"
@@ -2348,14 +2438,15 @@ corrupcion() {
 
 # Reinstala los paquetes con archivos faltantes/corruptos y re-verifica.
 reparar_paquetes_danados() {
-    local pkg="$1" tmp="$2" lista=""
+    local pkg="$1" tmp="$2"
+    local -a paquetes=()
     case "$pkg" in
         pacman)
-            lista=$(cut -d: -f1 "$tmp" | sort -u)
+            mapfile -t paquetes < <(cut -d: -f1 "$tmp" | sort -u)
             ;;
         apt)
             # debsums -c devuelve rutas; se mapean a su paquete con dpkg -S.
-            lista=$(while IFS= read -r f; do
+            mapfile -t paquetes < <(while IFS= read -r f; do
                         [[ -z "$f" ]] && continue
                         [[ "$f" != /* ]] && f="/$f"
                         dpkg -S "$f" 2>/dev/null | cut -d: -f1
@@ -2363,35 +2454,33 @@ reparar_paquetes_danados() {
             ;;
     esac
 
-    if [[ -z "$lista" ]]; then
+    if (( ${#paquetes[@]} == 0 )); then
         echo -e "${YELLOW}No se pudieron identificar los paquetes; reinstálalos manualmente.${RESET}"
         return 0
     fi
 
     echo ""
     echo -e "${YELLOW}Paquetes a reparar:${RESET}"
-    echo "$lista" | sed 's/^/   - /'
+    printf '   - %s\n' "${paquetes[@]}"
     if confirmar "¿Reinstalar automáticamente estos paquetes para repararlos?"; then
         local ok=1
         case "$pkg" in
             pacman)
-                spinner "Reinstalando paquetes (pacman)" bash -c \
-                    "sudo pacman -S --noconfirm $lista" || ok=0
+                spinner "Reinstalando paquetes (pacman)" sudo pacman -S --noconfirm "${paquetes[@]}" || ok=0
                 ;;
             apt)
-                spinner "Reinstalando paquetes (apt)" bash -c \
-                    "sudo apt-get -y install --reinstall $lista" || ok=0
+                spinner "Reinstalando paquetes (apt)" sudo apt-get -y install --reinstall "${paquetes[@]}" || ok=0
                 ;;
         esac
         if [[ "$ok" -eq 1 ]]; then
-            echo -e "${GREEN}✔ Reparación completada${RESET}"
+            echo -e "${GREEN}[ OK ] Reparación completada${RESET}"
         else
-            echo -e "${RED}✘ La reparación terminó con errores; revisa los mensajes de arriba.${RESET}"
+            echo -e "${RED}[ ERROR ] La reparación terminó con errores; revisa los mensajes de arriba.${RESET}"
         fi
 
         # Re-verificación después de reparar.
         local tmp2 restantes
-        tmp2=$(mktemp)
+        tmp2=$(crear_temporal)
         case "$pkg" in
             pacman)
                 sudo pacman -Qk 2>/dev/null | grep -E '[1-9][0-9]* (missing files|archivos no encontrados)' > "$tmp2"
@@ -2402,9 +2491,9 @@ reparar_paquetes_danados() {
         esac
         restantes=$(wc -l < "$tmp2" 2>/dev/null || echo 0)
         if (( restantes > 0 )); then
-            echo -e "${YELLOW}⚠ Quedan ${restantes} problema(s) sin resolver.${RESET}"
+            echo -e "${YELLOW}[ WARN ] Quedan ${restantes} problema(s) sin resolver.${RESET}"
         else
-            echo -e "${GREEN}✔ Re-verificación sin errores. Todo correcto.${RESET}"
+            echo -e "${GREEN}[ OK ] Re-verificación sin errores. Todo correcto.${RESET}"
         fi
         rm -f "$tmp2"
     fi
@@ -2442,8 +2531,8 @@ archivos_grandes() {
     echo ""
 
     local tmp ddir rutas=() n=0 sel
-    tmp=$(mktemp)
-    ddir=$(mktemp)
+    tmp=$(crear_temporal)
+    ddir=$(crear_temporal)
 
     # 1) Archivos > 1 GB (con tamaño en bytes), excluye la papelera.
     spinner "Buscando archivos > 1 GB" bash -c \
@@ -2468,7 +2557,7 @@ archivos_grandes() {
     sort -k1,1nr "$tmp" -o "$tmp"
 
     if [[ ! -s "$tmp" ]]; then
-        echo -e "${GREEN}✔ No se encontraron archivos ni carpetas mayores a 1 GB${RESET}"
+        echo -e "${GREEN}[ OK ] No se encontraron archivos ni carpetas mayores a 1 GB${RESET}"
         rm -f "$tmp" "$ddir"
         pause
         return
@@ -2503,18 +2592,18 @@ archivos_grandes() {
         ruta=${rutas[$((idx - 1))]}
         [[ -e "$ruta" ]] || { echo -e "${YELLOW}  Ya no existe: $(truncate_path "$ruta")${RESET}"; continue; }
         if ruta_protegida "$ruta"; then
-            echo -e "${RED}✘ No se puede tocar (protegido): $(truncate_path "$ruta")${RESET}"
+            echo -e "${RED}[ ERROR ] No se puede tocar (protegido): $(truncate_path "$ruta")${RESET}"
             continue
         fi
         echo ""
         echo -e "  ${BOLD}Seleccionado [${idx}]:${RESET} $(truncate_path "$ruta")"
         if confirmar "  → ¿Enviar a la papelera?"; then
             if mover_a_papelera "$ruta"; then
-                echo -e "  ${GREEN}✔ Enviado a la papelera: $(truncate_path "$ruta")${RESET}"
+                echo -e "  ${GREEN}[ OK ] Enviado a la papelera: $(truncate_path "$ruta")${RESET}"
             else
-                echo -e "  ${RED}✘ Falló al mover. ¿Borrar definitivamente?${RESET}"
+                echo -e "  ${RED}[ ERROR ] Falló al mover. ¿Borrar definitivamente?${RESET}"
                 if confirmar "    → ¿Borrar permanentemente $(truncate_path "$ruta")?"; then
-                    rm -rf "$ruta" 2>/dev/null && echo -e "  ${GREEN}✔ Eliminado definitivamente${RESET}" || echo -e "  ${RED}✘ No se pudo eliminar (permisos)${RESET}"
+                    rm -rf "$ruta" 2>/dev/null && echo -e "  ${GREEN}[ OK ] Eliminado definitivamente${RESET}" || echo -e "  ${RED}[ ERROR ] No se pudo eliminar (permisos)${RESET}"
                 fi
             fi
         else
@@ -2538,16 +2627,16 @@ servicios_fallidos() {
     fi
 
     local tmpfile
-    tmpfile=$(mktemp)
+    tmpfile=$(crear_temporal)
     systemctl --failed --no-legend --plain > "$tmpfile" 2>/dev/null
 
     local total
     total=$(wc -l < "$tmpfile")
 
     if [[ "$total" -eq 0 ]]; then
-        echo -e "${GREEN}✔ No hay servicios fallidos${RESET}"
+        echo -e "${GREEN}[ OK ] No hay servicios fallidos${RESET}"
     else
-        echo -e "${YELLOW}⚠ ${total} servicio(s) con fallos:${RESET}"
+        echo -e "${YELLOW}[ WARN ] ${total} servicio(s) con fallos:${RESET}"
         awk '{print "   - " $1}' "$tmpfile"
         if confirmar "¿Intentar reiniciar estos servicios?"; then
             if ! check_sudo; then
@@ -2561,7 +2650,7 @@ servicios_fallidos() {
                 unidad=$(echo "$linea" | awk '{print $1}')
                 [[ -z "$unidad" ]] && continue
                 if sudo systemctl restart "$unidad" 2>/dev/null; then
-                    echo -e "${GREEN}✔ ${unidad} reiniciado${RESET}"
+                    echo -e "${GREEN}[ OK ] ${unidad} reiniciado${RESET}"
                     ok=$((ok + 1))
                 else
                     # Reparación automática de swaps rotos (típico en btrfs).
@@ -2593,7 +2682,7 @@ servicios_fallidos() {
                             if crear_archivo_swap "$rec_mb" "$src"; then
                                 sudo systemctl reset-failed "$unidad" 2>/dev/null || true
                                 if sudo systemctl restart "$unidad" 2>/dev/null || sudo swapon -a 2>/dev/null; then
-                                    echo -e "${GREEN}✔ ${unidad} reparado y en marcha${RESET}"
+                                    echo -e "${GREEN}[ OK ] ${unidad} reparado y en marcha${RESET}"
                                     ok=$((ok + 1))
                                     reparados=$((reparados + 1))
                                     reparado=1
@@ -2601,19 +2690,19 @@ servicios_fallidos() {
                             fi
                         fi
                         if [[ "$reparado" -eq 0 ]]; then
-                            echo -e "${RED}✘ No se pudo recuperar ${unidad}${RESET}"
+                            echo -e "${RED}[ ERROR ] No se pudo recuperar ${unidad}${RESET}"
                             echo -e "${DIM}   Diagnóstico: journalctl -u ${unidad} --no-pager | tail -20${RESET}"
                             fail=$((fail + 1))
                         fi
                     else
-                        echo -e "${RED}✘ Falló el reinicio de ${unidad}${RESET}"
+                        echo -e "${RED}[ ERROR ] Falló el reinicio de ${unidad}${RESET}"
                         echo -e "${DIM}   Diagnóstico: journalctl -u ${unidad} --no-pager | tail -20${RESET}"
                         fail=$((fail + 1))
                     fi
                 fi
             done 3< "$tmpfile"
                 if (( reparados > 0 )); then
-                    echo -e "${GREEN}✔ ${reparados} unit(s) de swap reconstruidos correctamente${RESET}"
+                    echo -e "${GREEN}[ OK ] ${reparados} unit(s) de swap reconstruidos correctamente${RESET}"
                 fi
                 registrar_ultima_accion "Servicios reiniciados (${ok} ok, ${fail} fallidos)"
             else
@@ -2677,7 +2766,7 @@ comprobar_update() {
     [[ -n "$remota" ]] || remota=$(obtener_version_remota)
 
     if [[ -z "$remota" ]]; then
-        [[ "${1:-}" != "--aviso" ]] && echo -e "${YELLOW}⚠ No se pudo consultar la última versión (sin conexión).${RESET}"
+        [[ "${1:-}" != "--aviso" ]] && echo -e "${YELLOW}[ WARN ] No se pudo consultar la última versión (sin conexión).${RESET}"
         return 1
     fi
 
@@ -2725,7 +2814,7 @@ reemplazar_script() {
     if [[ "$(id -u)" -ne 0 ]] && [[ ! -w "$dir" ]]; then
         usar_sudo=1
         if [[ "${3:-}" != "--sudo-ya" ]] && ! check_sudo; then
-            echo -e "${RED}✘ Sin permisos de escritura ni sudo. No se pudo actualizar.${RESET}"
+            echo -e "${RED}[ ERROR ] Sin permisos de escritura ni sudo. No se pudo actualizar.${RESET}"
             return 1
         fi
     fi
@@ -2780,41 +2869,41 @@ actualizaciones_auto() {
     fi
 
     if ! version_es_mayor "$remota" "$VERSION"; then
-        echo -e "${GREEN}✔ Ya estás en la última versión (${VERSION}).${RESET}"
+        echo -e "${GREEN}[ OK ] Ya estás en la última versión (${VERSION}).${RESET}"
         registrar_ultima_accion "Comprobación de actualizaciones (sin novedades)"
         pause
         return
     fi
 
-    echo -e "${GREEN}✔ Se encontró una actualización:${RESET} ${BOLD}${VERSION} → ${remota}${RESET}"
+    echo -e "${GREEN}[ OK ] Se encontró una actualización:${RESET} ${BOLD}${VERSION} → ${remota}${RESET}"
     echo ""
 
     if confirmar "¿Descargar e instalar la versión ${remota} ahora?"; then
         local tmp
-        tmp=$(mktemp)
+        tmp=$(crear_temporal) || { echo -e "${RED}[ ERROR ] No se pudo crear un temporal para la actualización.${RESET}"; pause; return 1; }
         echo -e "${YELLOW}Descargando Kyro ${remota}...${RESET}"
         if descargar_script_remoto "$tmp"; then
             # Valida el script descargado antes de tocar el instalado.
             if ! bash -n "$tmp" 2>/dev/null; then
-                echo -e "${RED}✘ La descarga está corrupta (no es un script válido).${RESET}"
+                echo -e "${RED}[ ERROR ] La descarga está corrupta (no es un script válido).${RESET}"
                 echo -e "${DIM}   No se tocó tu instalación. Inténtalo de nuevo.${RESET}"
-                rm -f "$tmp"
+                eliminar_temporal "$tmp"
                 pause
                 return
             fi
             # Sustituye el script actual por el nuevo y lo deja ejecutable.
             if reemplazar_script "$tmp" "$SCRIPT_PATH" && chmod +x "$SCRIPT_PATH" 2>/dev/null; then
-                echo -e "${GREEN}✔ Kyro actualizado a ${remota}. Se relanzará con la nueva versión.${RESET}"
+                echo -e "${GREEN}[ OK ] Kyro actualizado a ${remota}. Se relanzará con la nueva versión.${RESET}"
                 registrar_ultima_accion "Actualización de Kyro (${VERSION} → ${remota})"
-                rm -f "$tmp"
+                eliminar_temporal "$tmp"
                 exec bash "$SCRIPT_PATH"
             else
-                echo -e "${RED}✘ No se pudo reemplazar el script (permisos?).${RESET}"
+                echo -e "${RED}[ ERROR ] No se pudo reemplazar el script (permisos?).${RESET}"
                 echo -e "${DIM}   Intenta manualmente: sudo install -m 755 '$tmp' '$SCRIPT_PATH'${RESET}"
-                rm -f "$tmp"
+                eliminar_temporal "$tmp"
             fi
         else
-            echo -e "${RED}✘ Error al descargar la actualización.${RESET}"
+            echo -e "${RED}[ ERROR ] Error al descargar la actualización.${RESET}"
             rm -f "$tmp"
         fi
     else
@@ -2941,14 +3030,14 @@ optimizar_red() {
         for kv in "net.core.default_qdisc=fq" "net.ipv4.tcp_congestion_control=bbr"; do
             k=${kv%%=*}; v=${kv#*=}
             if sudo sysctl -w "$k=$v" >/dev/null 2>&1; then
-                echo -e "   ${GREEN}✔${RESET} $k = $v"
+                echo -e "   ${GREEN}[ OK ]${RESET} $k = $v"
                 KYRO_NET+=("$kv")
             else
-                echo -e "   ${YELLOW}⚠${RESET} $k (no aplicable)"
+                echo -e "   ${YELLOW}[ WARN ]${RESET} $k (no aplicable)"
             fi
         done
     else
-        echo -e "   ${YELLOW}⚠ BBR no disponible (módulo tcp_bbr). Se aplicarán solo los buffers.${RESET}"
+        echo -e "   ${YELLOW}[ WARN ] BBR no disponible (módulo tcp_bbr). Se aplicarán solo los buffers.${RESET}"
     fi
     echo ""
 
@@ -2968,10 +3057,10 @@ optimizar_red() {
     for kv in "${net[@]}"; do
         k=${kv%%=*}; v=${kv#*=}
         if sudo sysctl -w "$k=$v" >/dev/null 2>&1; then
-            echo -e "   ${GREEN}✔${RESET} $k = $v"
+            echo -e "   ${GREEN}[ OK ]${RESET} $k = $v"
             KYRO_NET+=("$kv")
         else
-            echo -e "   ${YELLOW}⚠${RESET} $k (no aplicable)"
+            echo -e "   ${YELLOW}[ WARN ]${RESET} $k (no aplicable)"
         fi
     done
     echo ""
@@ -2997,15 +3086,15 @@ optimizar_red() {
             net_vel=$(cat "/sys/class/net/$iface_default/speed" 2>/dev/null)
             if [[ "$net_vel" =~ ^[0-9]+$ ]] && (( net_vel >= 100 )); then
                 if sudo tc qdisc replace dev "$iface_default" root "${qdisc_rec}" bandwidth "${net_vel}Mbit" >/dev/null 2>&1; then
-                    echo -e "   ${GREEN}✔ ${qdisc_rec} aplicado (≈${net_vel} Mbit/s)${RESET}"
+                    echo -e "   ${GREEN}[ OK ] ${qdisc_rec} aplicado (≈${net_vel} Mbit/s)${RESET}"
                     qdisc_aplicado=1
                 fi
             elif sudo tc qdisc replace dev "$iface_default" root "${qdisc_rec}" >/dev/null 2>&1; then
-                echo -e "   ${GREEN}✔ ${qdisc_rec} aplicado (ancho de banda sin limitar)${RESET}"
+                echo -e "   ${GREEN}[ OK ] ${qdisc_rec} aplicado (ancho de banda sin limitar)${RESET}"
                 qdisc_aplicado=1
             fi
             if (( qdisc_aplicado == 0 )); then
-                echo -e "   ${YELLOW}⚠ No se pudo aplicar el qdisc (¿tc disponible y permisos?).${RESET}"
+                echo -e "   ${YELLOW}[ WARN ] No se pudo aplicar el qdisc (¿tc disponible y permisos?).${RESET}"
             fi
         fi
     fi
@@ -3025,7 +3114,7 @@ optimizar_red() {
             local qb="/usr/local/bin/kyro-net-qdisc.sh"
             local qs="/etc/systemd/system/kyro-net.service"
             local qtmp
-            qtmp=$(mktemp)
+            qtmp=$(crear_temporal)
             {
                 echo "#!/bin/bash"
                 echo "# Generado por Kyro (optimización de red). No editar a mano."
@@ -3053,19 +3142,19 @@ WantedBy=multi-user.target
 EOF
                 sudo systemctl daemon-reload >/dev/null 2>&1
                 if sudo systemctl enable --now kyro-net.service >/dev/null 2>&1; then
-                    echo -e "   ${GREEN}✔ qdisc persistente (kyro-net.service)${RESET}"
+                    echo -e "   ${GREEN}[ OK ] qdisc persistente (kyro-net.service)${RESET}"
                 else
-                    echo -e "   ${YELLOW}⚠ Script guardado, pero no se pudo activar el servicio.${RESET}"
+                    echo -e "   ${YELLOW}[ WARN ] Script guardado, pero no se pudo activar el servicio.${RESET}"
                 fi
             else
-                echo -e "   ${YELLOW}⚠ No se pudo escribir el script persistente del qdisc.${RESET}"
+                echo -e "   ${YELLOW}[ WARN ] No se pudo escribir el script persistente del qdisc.${RESET}"
             fi
             rm -f "$qtmp"
         fi
     fi
     registrar_ultima_accion "Optimización de red (BBR + buffers + qdisc, ${#KYRO_NET[@]} sysctls)"
     echo ""
-    echo -e "${GREEN}✔ Optimización de red finalizada${RESET}"
+    echo -e "${GREEN}[ OK ] Optimización de red finalizada${RESET}"
     pause
 }
 
@@ -3227,9 +3316,9 @@ chequeo_salud() {
     for it in "${items[@]}"; do
         lvl=${it%%|*}; msg=${it#*|}
         case "$lvl" in
-            ok)   echo -e "   ${GREEN}✔${RESET} $msg" ;;
-            warn) echo -e "   ${YELLOW}⚠${RESET} $msg" ;;
-            crit) echo -e "   ${RED}✘${RESET} $msg" ;;
+            ok)   echo -e "   ${GREEN}[ OK ]${RESET} $msg" ;;
+            warn) echo -e "   ${YELLOW}[ WARN ]${RESET} $msg" ;;
+            crit) echo -e "   ${RED}[ ERROR ]${RESET} $msg" ;;
         esac
     done
     echo ""
@@ -3237,7 +3326,7 @@ chequeo_salud() {
     if (( crit > 0 || warn > 0 )); then
         echo -e "${DIM}Resuelve los puntos pendientes con las opciones indicadas del menú.${RESET}"
     else
-        echo -e "${GREEN}✔ Sistema en buen estado general.${RESET}"
+        echo -e "${GREEN}[ OK ] Sistema en buen estado general.${RESET}"
     fi
     registrar_ultima_accion "Chequeo de salud (${ok} ok, ${warn} avisos, ${crit} críticos)"
     pause
@@ -3263,7 +3352,7 @@ limpieza_profunda() {
     # ── 1) Coredumps antiguos ──
     if [[ -d /var/lib/systemd/coredump ]] && confirmar "→ ¿Eliminar volcados de memoria (coredumps) de más de 14 días?"; then
         sudo find /var/lib/systemd/coredump -type f -mtime +14 -delete 2>/dev/null
-        echo -e "   ${GREEN}✔ Coredumps antiguos eliminados${RESET}"
+        echo -e "   ${GREEN}[ OK ] Coredumps antiguos eliminados${RESET}"
     fi
 
     # ── 2) Kernels antiguos (deja el actual + el anterior) ──
@@ -3282,11 +3371,12 @@ limpieza_profunda() {
             # Candidatos = todos menos el activo y los meta.
             resto=$(echo "$instalados" | grep -vx "$activo_pkg" | grep -v '.-meta$' | tr '\n' ' ')
             if [[ -n "$resto" ]] && confirmar "     → ¿Eliminar los kernels no activos: $resto (dejará solo el activo)?"; then
-                sudo pacman -Rns --noconfirm $resto 2>/dev/null || echo -e "   ${YELLOW}⚠ No se pudieron eliminar algunos kernels.${RESET}"
-                echo -e "   ${GREEN}✔ Kernels antiguos eliminados: $resto${RESET}"
+                read -r -a kernel_pkgs <<< "$resto"
+                sudo pacman -Rns --noconfirm "${kernel_pkgs[@]}" 2>/dev/null || echo -e "   ${YELLOW}[ WARN ]${RESET} No se pudieron eliminar algunos kernels."
+                echo -e "   ${GREEN}[ OK ] Kernels antiguos eliminados: $resto${RESET}"
             fi
         else
-            echo -e "   ${YELLOW}⚠ kernel no identificable (¿distro con kernel de paquete distinto?).${RESET}"
+            echo -e "   ${YELLOW}[ WARN ] kernel no identificable (¿distro con kernel de paquete distinto?).${RESET}"
         fi
     fi
 
@@ -3295,17 +3385,18 @@ limpieza_profunda() {
         local huerc
         huerc=$(pacman -Qtdq 2>/dev/null | wc -l)
         if (( huerc > 0 )); then
-            sudo pacman -Rns --noconfirm $(pacman -Qtdq 2>/dev/null) 2>/dev/null
-            echo -e "   ${GREEN}✔ ${huerc} paquete(s) huérfano(s) eliminados${RESET}"
+            mapfile -t orphan_pkgs < <(pacman -Qtdq 2>/dev/null)
+            sudo pacman -Rns --noconfirm "${orphan_pkgs[@]}" 2>/dev/null
+            echo -e "   ${GREEN}[ OK ] ${huerc} paquete(s) huérfano(s) eliminados${RESET}"
         else
-            echo -e "   ${YELLOW}⚠ No hay huérfanos.${RESET}"
+            echo -e "   ${YELLOW}[ WARN ] No hay huérfanos.${RESET}"
         fi
     fi
 
     # ── 4) Flatpak ──
     if command -v flatpak >/dev/null 2>&1 && confirmar "→ ¿Eliminar runtimes/paquetes Flatpak sin uso?"; then
         flatpak uninstall --unused --assumeyes 2>/dev/null || true
-        spinner "Flatpak: caché" bash -c "rm -rf \"$HOME/.var/app\"/*/cache 2>/dev/null"
+        spinner "Flatpak: caché" bash -c 'set -f; for d in "$HOME"/.var/app/*/cache; do [[ -d "$d" ]] && rm -rf -- "$d"; done' 
         # también el caché de thumbnailer flatpak
         rm -rf "$HOME/.cache/thumbnails" 2>/dev/null
     fi
@@ -3317,32 +3408,32 @@ limpieza_profunda() {
             [[ -n "$sname" && -n "$srev" ]] || continue
             sudo snap remove "$sname" --revision="$srev" 2>/dev/null
         done < <(sudo snap list --all 2>/dev/null | awk '/disabled/{print $1, $3}')
-        echo -e "   ${GREEN}✔ Snap: revisiones deshabilitadas eliminadas${RESET}"
+        echo -e "   ${GREEN}[ OK ] Snap: revisiones deshabilitadas eliminadas${RESET}"
     fi
 
     # ── 6) Docker ──
     if command -v docker >/dev/null 2>&1 && confirmar "→ ¿Podar todo lo no usado de Docker (contenedores parados, redes e imágenes)? [y/N]"; then
         sudo docker system prune -af 2>/dev/null || sudo docker system prune -f 2>/dev/null
-        echo -e "   ${GREEN}✔ Docker podado${RESET}"
+        echo -e "   ${GREEN}[ OK ] Docker podado${RESET}"
     fi
 
     # ── 7) Podman ──
     if command -v podman >/dev/null 2>&1 && confirmar "→ ¿Podar todo lo no usado de Podman?"; then
         sudo podman system prune -af 2>/dev/null || true
-        echo -e "   ${GREEN}✔ Podman podado${RESET}"
+        echo -e "   ${GREEN}[ OK ] Podman podado${RESET}"
     fi
 
     # ── 8) Logs ──
     if command -v journalctl >/dev/null 2>&1 && confirmar "→ ¿Limitar los logs del sistema a 200 MB?"; then
         sudo journalctl --vacuum-size=200M 2>/dev/null
         sudo journalctl --vacuum-time=30d 2>/dev/null
-        echo -e "   ${GREEN}✔ Logs limitados a 200 MB / 30 días${RESET}"
+        echo -e "   ${GREEN}[ OK ] Logs limitados a 200 MB / 30 días${RESET}"
     fi
 
     # ── 9) /var/log accesibles y logs de apps ──
     if confirmar "→ ¿Vaciar logs antiguos de /var/log (apache, nginx, mysql, etc.)?"; then
         sudo find /var/log -type f \( -name '*.gz' -o -name '*.old' -o -name '*.1' -o -name '*.2' -o -name '*.3' -o -name '*.4' \) -delete 2>/dev/null
-        echo -e "   ${GREEN}✔ Logs rotados antiguos eliminados${RESET}"
+        echo -e "   ${GREEN}[ OK ] Logs rotados antiguos eliminados${RESET}"
     fi
 
     # ── 10) Restos de paquetes (#.pacnew / .pacsave) ──
@@ -3359,10 +3450,10 @@ limpieza_profunda() {
                 mv "$1" "$b" 2>/dev/null' _ {} \; 2>/dev/null
             sudo find /etc -type f -name '*.pacsave' -exec sh -c '
                 mv "$1" "${1}.bak$(date +%Y%m%d%H%M%S)" 2>/dev/null' _ {} \; 2>/dev/null
-            echo -e "   ${GREEN}✔ ${pacf} archivo(s) de configuración gestionados${RESET}"
+            echo -e "   ${GREEN}[ OK ] ${pacf} archivo(s) de configuración gestionados${RESET}"
             echo -e "   ${DIM}   Versiones anteriores conservadas como *.pacsave.bak*${RESET}"
         else
-            echo -e "   ${YELLOW}⚠ No hay .pacnew/.pacsave.${RESET}"
+            echo -e "   ${YELLOW}[ WARN ] No hay .pacnew/.pacsave.${RESET}"
         fi
     fi
 
@@ -3384,7 +3475,7 @@ limpieza_profunda() {
         for c in "${extras[@]}"; do
             [[ -e "$c" ]] && rm -rf "$c" 2>/dev/null
         done
-        echo -e "   ${GREEN}✔ Cachés de runtime eliminados ($(formatear_bytes "$liberado_extra"))${RESET}"
+        echo -e "   ${GREEN}[ OK ] Cachés de runtime eliminados ($(formatear_bytes "$liberado_extra"))${RESET}"
     elif (( liberado_extra > 0 )); then
         echo -e "   ${DIM}   Cachés de runtime conservados.${RESET}"
     fi
@@ -3393,15 +3484,15 @@ limpieza_profunda() {
     if command -v pacman >/dev/null 2>&1 && confirmar "→ ¿Limpiar también los paquetes de la caché ya desinstalados (paccache -ruk0)?"; then
         if command -v paccache >/dev/null 2>&1; then
             sudo paccache -ruk0 2>/dev/null
-            echo -e "   ${GREEN}✔ Caché de paquetes desinstalados purgada${RESET}"
+            echo -e "   ${GREEN}[ OK ] Caché de paquetes desinstalados purgada${RESET}"
         else
-            echo -e "   ${YELLOW}⚠ paccache no está instalado (pacman-contrib).${RESET}"
+            echo -e "   ${YELLOW}[ WARN ] paccache no está instalado (pacman-contrib).${RESET}"
         fi
     fi
 
     echo ""
     echo -e "${YELLOW}════════════════════════════════════════════════════════════${RESET}"
-    echo -e "${GREEN}✔  Limpieza profunda finalizada${RESET}"
+    echo -e "${GREEN}[ OK ]  Limpieza profunda finalizada${RESET}"
     echo -e "${YELLOW}════════════════════════════════════════════════════════════${RESET}"
     registrar_ultima_accion "Limpieza profunda"
     pause
@@ -3450,33 +3541,33 @@ optimizar_juegos() {
                 [[ -w "$dpm" ]] || continue
                 echo "performance" | sudo tee "$dpm" >/dev/null 2>&1 && dpm_levels=1
             done
-            (( dpm_levels == 1 )) && echo -e "   ${GREEN}✔ power_dpm_force_performance_level=performance${RESET}" \
-                || echo -e "   ${YELLOW}⚠ sin control DPM de AMD accesible${RESET}"
+            (( dpm_levels == 1 )) && echo -e "   ${GREEN}[ OK ] power_dpm_force_performance_level=performance${RESET}" \
+                || echo -e "   ${YELLOW}[ WARN ] sin control DPM de AMD accesible${RESET}"
             # Perfiles de potencia de la VRM si el controlador los expone.
             for cfg in /sys/class/drm/card*/device/power_pp_profile_mode; do
                 if [[ -w "$cfg" ]]; then
-                    echo "1" | sudo tee "$cfg" >/dev/null 2>&1 && echo -e "   ${GREEN}✔ power_pp_profile_mode=1 (máx. rendimiento)${RESET}"
+                    echo "1" | sudo tee "$cfg" >/dev/null 2>&1 && echo -e "   ${GREEN}[ OK ] power_pp_profile_mode=1 (máx. rendimiento)${RESET}"
                 fi
             done
             ;;
         nvidia)
             if command -v nvidia-smi >/dev/null 2>&1; then
-                sudo nvidia-smi -pm 1 >/dev/null 2>&1 && echo -e "   ${GREEN}✔ Persistence Mode activado (-pm 1)${RESET}" \
-                    || echo -e "   ${YELLOW}⚠ nvidia-smi no pudo activar persistence${RESET}"
+                sudo nvidia-smi -pm 1 >/dev/null 2>&1 && echo -e "   ${GREEN}[ OK ] Persistence Mode activado (-pm 1)${RESET}" \
+                    || echo -e "   ${YELLOW}[ WARN ] nvidia-smi no pudo activar persistence${RESET}"
             else
-                echo -e "   ${YELLOW}⚠ nvidia-smi no instalado${RESET}"
+                echo -e "   ${YELLOW}[ WARN ] nvidia-smi no instalado${RESET}"
             fi
             ;;
         intel)
             echo -e "   ${DIM}Intel integrada: sin perfil GPU manual (usa el gobernador de la bisagra).${RESET}"
             ;;
         *)
-            echo -e "   ${YELLOW}⚠ GPU no identificada; se omite el perfil de la GPU.${RESET}"
+            echo -e "   ${YELLOW}[ WARN ] GPU no identificada; se omite el perfil de la GPU.${RESET}"
             ;;
     esac
 
     if command -v gamemoderun >/dev/null 2>&1; then
-        echo -e "   ${GREEN}✔ Feral GameMode detectado: usa 'gamemoderun %command%' en Steam.${RESET}"
+        echo -e "   ${GREEN}[ OK ] Feral GameMode detectado: usa 'gamemoderun %command%' en Steam.${RESET}"
     fi
     echo ""
 
@@ -3492,7 +3583,7 @@ optimizar_juegos() {
     for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
         [[ -f "$g" ]] && echo "$gov" | sudo tee "$g" >/dev/null 2>&1 && govok=1
     done
-    [[ "$govok" -eq 1 ]] && echo -e "   ${GREEN}✔ Gobernador CPU: ${gov}${RESET}" || echo -e "   ${YELLOW}⚠ sin cpufreq (se omite)${RESET}"
+    [[ "$govok" -eq 1 ]] && echo -e "   ${GREEN}[ OK ] Gobernador CPU: ${gov}${RESET}" || echo -e "   ${YELLOW}[ WARN ] sin cpufreq (se omite)${RESET}"
 
     # kernel.game_mode (parche GameMode de Feral/CachyOS) si está expuesto.
     if [[ -f /proc/sys/kernel/game_mode ]]; then
@@ -3519,7 +3610,7 @@ optimizar_juegos() {
             echo "$rec" | sudo tee "$q" >/dev/null 2>&1 && sched_ok=1
         fi
     done
-    [[ "$sched_ok" -eq 1 ]] && echo -e "   ${GREEN}✔ Scheduler: ${rec} en todos los discos${RESET}" || echo -e "   ${YELLOW}⚠ sin discos ajustables${RESET}"
+    [[ "$sched_ok" -eq 1 ]] && echo -e "   ${GREEN}[ OK ] Scheduler: ${rec} en todos los discos${RESET}" || echo -e "   ${YELLOW}[ WARN ] sin discos ajustables${RESET}"
     echo ""
 
     # ── Steam: limpieza de shader caches (se regeneran solos) ──
@@ -3560,7 +3651,7 @@ apply_cpu_optimisations=accept-responsibility
 start=notify-send "GameMode activado"
 end=notify-send "GameMode desactivado"
 EOF
-                echo -e "   ${GREEN}✔ gamemode.ini creado (usa 'gamemoderun %command%' en Steam)${RESET}"
+                echo -e "   ${GREEN}[ OK ] gamemode.ini creado (usa 'gamemoderun %command%' en Steam)${RESET}"
             fi
         else
             echo -e "   ${DIM}gamemode.ini ya existe; no se modifica nada.${RESET}"
@@ -3581,7 +3672,7 @@ EOF
 
     registrar_ultima_accion "Optimización gaming (GPU=$vendor, gov=$gov)"
     echo ""
-    echo -e "${GREEN}✔ Optimización gaming finalizada${RESET}"
+    echo -e "${GREEN}[ OK ] Optimización gaming finalizada${RESET}"
     pause
 }
 
@@ -3591,7 +3682,7 @@ persistir_juegos() {
     local bin="/usr/local/bin/kyro-game-apply.sh"
     local svc="/etc/systemd/system/kyro-game.service"
     local tmpbin
-    tmpbin=$(mktemp)
+    tmpbin=$(crear_temporal)
 
     cat > "$tmpbin" <<EOF
 #!/bin/bash
@@ -3631,15 +3722,15 @@ WantedBy=multi-user.target
 EOF
         sudo systemctl daemon-reload >/dev/null 2>&1
         if sudo systemctl enable --now kyro-game.service >/dev/null 2>&1; then
-            echo -e "   ${GREEN}✔ Servicio kyro-game activado (persistente)${RESET}"
+            echo -e "   ${GREEN}[ OK ] Servicio kyro-game activado (persistente)${RESET}"
         else
-            echo -e "   ${YELLOW}⚠ Script guardado, pero no se pudo activar el servicio.${RESET}"
+            echo -e "   ${YELLOW}[ WARN ] Script guardado, pero no se pudo activar el servicio.${RESET}"
         fi
         rm -f "$tmpbin"
         return 0
     fi
     rm -f "$tmpbin"
-    echo -e "   ${RED}✘ No se pudo escribir el script persistente (¿sudo?).${RESET}"
+    echo -e "   ${RED}[ ERROR ] No se pudo escribir el script persistente (¿sudo?).${RESET}"
     return 1
 }
 
@@ -3713,7 +3804,7 @@ limpiar_steam() {
         done
     done
     if (( huerfanos == 0 )); then
-        echo -e "   ${GREEN}✔ Sin prefijos Proton huérfanos.${RESET}"
+        echo -e "   ${GREEN}[ OK ] Sin prefijos Proton huérfanos.${RESET}"
     else
         local hsel otro
         echo ""
@@ -3732,7 +3823,7 @@ limpiar_steam() {
                 for otro in $hsel; do
                     if [[ "$otro" == "$hidx" ]]; then
                         if mover_a_papelera "$cd_path/$appid" 2>/dev/null; then
-                            echo -e "   ${GREEN}✔ Enviado a la papelera (appid ${appid})${RESET}"
+                            echo -e "   ${GREEN}[ OK ] Enviado a la papelera (appid ${appid})${RESET}"
                         elif confirmar "    → No se pudo mover ${appid} a la papelera. ¿Borrar definitivamente?"; then
                             liberado=$((liberado + $(eliminar_y_medir "$cd_path/$appid" 1)))
                         fi
@@ -3745,7 +3836,7 @@ limpiar_steam() {
 
     echo ""
     echo -e "${YELLOW}════════════════════════════════════════════════════════════${RESET}"
-    echo -e "${GREEN}✔  Mantenimiento de Steam completado${RESET}  ${DIM}($(formatear_bytes "$liberado") liberados)${RESET}"
+    echo -e "${GREEN}[ OK ]  Mantenimiento de Steam completado${RESET}  ${DIM}($(formatear_bytes "$liberado") liberados)${RESET}"
     echo -e "${YELLOW}════════════════════════════════════════════════════════════${RESET}"
     registrar_ultima_accion "Mantenimiento de Steam ($(formatear_bytes "$liberado"))"
     pause
@@ -3772,12 +3863,12 @@ restaurar_optimizacion() {
         sudo rm -f "/etc/systemd/system/$svc.service" 2>/dev/null
     done
     sudo systemctl daemon-reload 2>/dev/null
-    echo -e "${GREEN}✔ Servicios de Kyro detenidos y eliminados${RESET}"
+    echo -e "${GREEN}[ OK ] Servicios de Kyro detenidos y eliminados${RESET}"
 
     # 2) Borra los archivos sysctl y scripts de Kyro.
     sudo rm -f /etc/sysctl.d/99-kyro-optimizer.conf /etc/sysctl.d/99-kyro-network.conf /etc/sysctl.d/99-kyro-gaming.conf 2>/dev/null
     sudo rm -f /usr/local/bin/kyro-perf-apply.sh /usr/local/bin/kyro-quick-apply.sh /usr/local/bin/kyro-game-apply.sh /usr/local/bin/kyro-net-qdisc.sh 2>/dev/null
-    echo -e "${GREEN}✔ Configuración sysctl de Kyro eliminada${RESET}"
+    echo -e "${GREEN}[ OK ] Configuración sysctl de Kyro eliminada${RESET}"
 
     # 3) Devuelve los qdisc de red al que eligió el sistema.
     if command -v tc >/dev/null 2>&1; then
@@ -3787,7 +3878,7 @@ restaurar_optimizacion() {
             [[ "$qif" == "lo" ]] && continue
             sudo tc qdisc del dev "$qif" root 2>/dev/null
         done
-        echo -e "${GREEN}✔ Qdisc de red restaurados${RESET}"
+        echo -e "${GREEN}[ OK ] Qdisc de red restaurados${RESET}"
     fi
 
     # 4) Restaura los valores por defecto del kernel (solo si están activos).
@@ -3796,7 +3887,7 @@ restaurar_optimizacion() {
     local d
     for d in $dflt; do
         if sudo sysctl -w "$d" >/dev/null 2>&1; then
-            echo -e "   ${GREEN}✔${RESET} $d"
+            echo -e "   ${GREEN}[ OK ]${RESET} $d"
         fi
     done
 
@@ -3810,11 +3901,11 @@ restaurar_optimizacion() {
         sudo sed -i "\|${sfile}|d" /etc/fstab 2>/dev/null
         sudo rm -f "$sfile" 2>/dev/null
         sudo systemctl daemon-reload 2>/dev/null
-        echo -e "   ${GREEN}✔ Swap de Kyro eliminado${RESET}"
+        echo -e "   ${GREEN}[ OK ] Swap de Kyro eliminado${RESET}"
     fi
 
     echo ""
-    echo -e "${GREEN}✔ Ajustes de Kyro restaurados a los valores de fábrica${RESET}"
+    echo -e "${GREEN}[ OK ] Ajustes de Kyro restaurados a los valores de fábrica${RESET}"
     registrar_ultima_accion "Restauración de ajustes de Kyro"
     pause
 }
@@ -3852,24 +3943,24 @@ estabilizador() {
     case "$pkg" in
         pacman)
             if sudo pacman -Dk 2>/dev/null | grep -iE 'error|unresolvable|missing'; then
-                echo -e "   ${YELLOW}⚠ La base de datos tiene inconsistencia.${RESET}"
+                echo -e "   ${YELLOW}[ WARN ] La base de datos tiene inconsistencia.${RESET}"
                 if confirmar "  → ¿Reconstruir la base de datos (pacman -Dk / refresh)?"; then
                     sudo pacman -Syy 2>/dev/null
-                    echo -e "   ${GREEN}✔ Base de datos refrescada.${RESET}"
+                    echo -e "   ${GREEN}[ OK ] Base de datos refrescada.${RESET}"
                 fi
             else
-                echo -e "   ${GREEN}✔ Base de datos de paquetes correcta.${RESET}"
+                echo -e "   ${GREEN}[ OK ] Base de datos de paquetes correcta.${RESET}"
             fi
             ;;
         apt)
             if sudo dpkg --audit 2>/dev/null | grep -iE 'error|inconsistent|missing'; then
-                echo -e "   ${YELLOW}⚠ dpkg tiene paquetes inconsistentes.${RESET}"
+                echo -e "   ${YELLOW}[ WARN ] dpkg tiene paquetes inconsistentes.${RESET}"
                 if confirmar "  → ¿Intentar reparar (dpkg --configure -a)?"; then
                     sudo dpkg --configure -a 2>/dev/null
-                    echo -e "   ${GREEN}✔ dpkg reparado.${RESET}"
+                    echo -e "   ${GREEN}[ OK ] dpkg reparado.${RESET}"
                 fi
             else
-                echo -e "   ${GREEN}✔ Base de datos de paquetes correcta.${RESET}"
+                echo -e "   ${GREEN}[ OK ] Base de datos de paquetes correcta.${RESET}"
             fi
             ;;
         *)  echo -e "   ${DIM}   Gestor no soportado, se omite.${RESET}" ;;
@@ -3879,24 +3970,24 @@ estabilizador() {
     echo -e "${BOLD}▸ 2) Journal de systemd${RESET}"
     if command -v journalctl >/dev/null 2>&1; then
         if sudo journalctl --verify 2>/dev/null | grep -iE 'fail|error' | grep -v 'no errors'; then
-            echo -e "   ${YELLOW}⚠ El journal presenta errores.${RESET}"
+            echo -e "   ${YELLOW}[ WARN ] El journal presenta errores.${RESET}"
             if confirmar "  → ¿Rotar y conservar solo 200 MB (descarta corruptos)?"; then
                 sudo journalctl --rotate 2>/dev/null
                 sudo journalctl --vacuum-size=200M 2>/dev/null
-                echo -e "   ${GREEN}✔ Journal rotado y saneado.${RESET}"
+                echo -e "   ${GREEN}[ OK ] Journal rotado y saneado.${RESET}"
             fi
         else
-            echo -e "   ${GREEN}✔ Journal íntegro.${RESET}"
+            echo -e "   ${GREEN}[ OK ] Journal íntegro.${RESET}"
         fi
         # Asegura límites de crecimiento del journal (evita llenar disco).
         if ! grep -q 'SystemMaxUse' /etc/systemd/journald.conf 2>/dev/null; then
             if confirmar "  → ¿Limitar el journal a 300 MB (evita discos llenos)?"; then
                 echo -e "SystemMaxUse=300M\nSystemKeepFree=100M" | sudo tee -a /etc/systemd/journald.conf >/dev/null 2>&1
                 sudo systemctl restart systemd-journald 2>/dev/null || sudo journalctl --flush 2>/dev/null
-                echo -e "   ${GREEN}✔ Journal limitado a 300 MB.${RESET}"
+                echo -e "   ${GREEN}[ OK ] Journal limitado a 300 MB.${RESET}"
             fi
         else
-            echo -e "   ${GREEN}✔ Journal ya limitado.${RESET}"
+            echo -e "   ${GREEN}[ OK ] Journal ya limitado.${RESET}"
         fi
     else
         echo -e "   ${DIM}   journalctl no disponible.${RESET}"
@@ -3907,16 +3998,16 @@ estabilizador() {
     local fallidos
     fallidos=$(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}')
     if [[ -n "$fallidos" ]]; then
-        echo -e "   ${YELLOW}⚠ Servicios fallidos:${RESET}"
+        echo -e "   ${YELLOW}[ WARN ] Servicios fallidos:${RESET}"
         echo "$fallidos" | sed 's/^/      - /'
         if confirmar "  → ¿Intentar reiniciarlos?"; then
             local svc
             for svc in $fallidos; do
-                sudo systemctl restart "$svc" 2>/dev/null && echo -e "      ${GREEN}✔ ${svc} reiniciado${RESET}" || echo -e "      ${YELLOW}⚠ ${svc} sigue fallando${RESET}"
+                sudo systemctl restart "$svc" 2>/dev/null && echo -e "      ${GREEN}[ OK ] ${svc} reiniciado${RESET}" || echo -e "      ${YELLOW}[ WARN ] ${svc} sigue fallando${RESET}"
             done
         fi
     else
-        echo -e "   ${GREEN}✔ Sin servicios fallidos.${RESET}"
+        echo -e "   ${GREEN}[ OK ] Sin servicios fallidos.${RESET}"
     fi
 
     # ── 4) Sistema de archivos (correcciones menores) ──
@@ -3927,12 +4018,12 @@ estabilizador() {
         ext4|ext3)
             echo -e "   ${DIM}   Unidad: /dev/$(detectar_dispositivo_base) (${root_fs}).${RESET}"
             if confirmar "  → ¿Marca la unidad para revisión en el próximo arranque (fsck)? [y/N]"; then
-                sudo touch /forcefsck 2>/dev/null && echo -e "   ${GREEN}✔ Revisión programada en el próximo arranque.${RESET}"
+                sudo touch /forcefsck 2>/dev/null && echo -e "   ${GREEN}[ OK ] Revisión programada en el próximo arranque.${RESET}"
             fi
             ;;
         btrfs)
             if confirmar "  → ¿Ejecutar 'scrub' (verifica/regenera redundancia)?"; then
-                sudo btrfs scrub start / 2>/dev/null && echo -e "   ${GREEN}✔ Scrub de btrfs iniciado.${RESET}"
+                sudo btrfs scrub start / 2>/dev/null && echo -e "   ${GREEN}[ OK ] Scrub de btrfs iniciado.${RESET}"
             fi
             ;;
         *)  echo -e "   ${DIM}   Sistema '${root_fs:-desconocido}': no se requieren acciones.${RESET}" ;;
@@ -3944,9 +4035,9 @@ estabilizador() {
         local montaje_ok
         montaje_ok=$(sudo findmnt --verify --verbose 2>/dev/null | grep -c 'Successfully verified' || true)
         if (( montaje_ok > 0 )); then
-            echo -e "   ${GREEN}✔ /etc/fstab correcto.${RESET}"
+            echo -e "   ${GREEN}[ OK ] /etc/fstab correcto.${RESET}"
         else
-            echo -e "   ${YELLOW}⚠ No se pudo verificar completamente; revisa con 'findmnt --verify'.${RESET}"
+            echo -e "   ${YELLOW}[ WARN ] No se pudo verificar completamente; revisa con 'findmnt --verify'.${RESET}"
         fi
     fi
 
@@ -3963,17 +4054,17 @@ estabilizador() {
             b="${1%.pacnew}"
             [ -f "$b" ] && cp -a "$b" "${b}.pacsave" 2>/dev/null
             mv "$1" "$b" 2>/dev/null' _ {} \; 2>/dev/null
-        echo -e "   ${GREEN}✔ Configuraciones actualizadas (backups .pacsave conservados).${RESET}"
+        echo -e "   ${GREEN}[ OK ] Configuraciones actualizadas (backups .pacsave conservados).${RESET}"
     fi
 
     # ── 7) Variables de entorno del sistema (locale) ──
     echo -e "${BOLD}▸ 7) Locale del sistema${RESET}"
     if locale -a 2>/dev/null | grep -qi "$LANG" 2>/dev/null; then
-        echo -e "   ${GREEN}✔ Locale configurado (${LANG:-n/d}).${RESET}"
+        echo -e "   ${GREEN}[ OK ] Locale configurado (${LANG:-n/d}).${RESET}"
     else
-        echo -e "   ${YELLOW}⚠ El locale ${LANG:-n/d} no está generado.${RESET}"
+        echo -e "   ${YELLOW}[ WARN ] El locale ${LANG:-n/d} no está generado.${RESET}"
         if confirmar "  → ¿Generar los locales activos?"; then
-            sudo locale-gen 2>/dev/null && echo -e "   ${GREEN}✔ Locales regenerados.${RESET}"
+            sudo locale-gen 2>/dev/null && echo -e "   ${GREEN}[ OK ] Locales regenerados.${RESET}"
         fi
     fi
 
@@ -3981,20 +4072,20 @@ estabilizador() {
     echo -e "${BOLD}▸ 8) Cortafuegos${RESET}"
     if command -v firewall-cmd >/dev/null 2>&1; then
         if systemctl is-active --quiet firewalld; then
-            echo -e "   ${GREEN}✔ firewalld activo.${RESET}"
+            echo -e "   ${GREEN}[ OK ] firewalld activo.${RESET}"
         else
-            echo -e "   ${YELLOW}⚠ firewalld instalado pero inactivo.${RESET}"
+            echo -e "   ${YELLOW}[ WARN ] firewalld instalado pero inactivo.${RESET}"
             if confirmar "  → ¿Activar firewalld?"; then
-                sudo systemctl enable --now firewalld 2>/dev/null && echo -e "   ${GREEN}✔ firewalld activado.${RESET}"
+                sudo systemctl enable --now firewalld 2>/dev/null && echo -e "   ${GREEN}[ OK ] firewalld activado.${RESET}"
             fi
         fi
     elif command -v ufw >/dev/null 2>&1; then
         if sudo ufw status 2>/dev/null | grep -q 'Status: active'; then
-            echo -e "   ${GREEN}✔ ufw activo.${RESET}"
+            echo -e "   ${GREEN}[ OK ] ufw activo.${RESET}"
         else
-            echo -e "   ${YELLOW}⚠ ufw instalado pero inactivo.${RESET}"
+            echo -e "   ${YELLOW}[ WARN ] ufw instalado pero inactivo.${RESET}"
             if confirmar "  → ¿Activar ufw?"; then
-                sudo ufw enable 2>/dev/null && echo -e "   ${GREEN}✔ ufw activado.${RESET}"
+                sudo ufw enable 2>/dev/null && echo -e "   ${GREEN}[ OK ] ufw activado.${RESET}"
             fi
         fi
     else
@@ -4003,7 +4094,7 @@ estabilizador() {
 
     echo ""
     echo -e "${YELLOW}════════════════════════════════════════════════════════════${RESET}"
-    echo -e "${GREEN}✔  Estabilizador finalizado${RESET}"
+    echo -e "${GREEN}[ OK ]  Estabilizador finalizado${RESET}"
     echo -e "${YELLOW}════════════════════════════════════════════════════════════${RESET}"
     registrar_ultima_accion "Estabilizador del sistema"
     pause
@@ -4027,7 +4118,7 @@ reparar_paquetes() {
         pacman)
             echo -e "${DIM}   Verificando integridad de todos los paquetes...${RESET}"
             local tmp afuera malos
-            tmp=$(mktemp)
+            tmp=$(crear_temporal)
             # Igual patrón que corrupcion(): busca "N missing files" o
             # "N archivos no encontrados" con N > 0 (pacman -Qk devuelve 1)
             # ante warnings de permisos, así que la salida decide.
@@ -4035,17 +4126,17 @@ reparar_paquetes() {
                 "sudo pacman -Qk 2>/dev/null | grep -E '[1-9][0-9]* (missing files|archivos no encontrados)' > \"$tmp\""
             afuera=$(wc -l < "$tmp" 2>/dev/null || echo 0)
             if (( afuera > 0 )); then
-                echo -e "   ${YELLOW}⚠ ${afuera} paquete(s) con problemas detectados.${RESET}"
+                echo -e "   ${YELLOW}[ WARN ] ${afuera} paquete(s) con problemas detectados.${RESET}"
                 sed 's/^/      /' "$tmp" | head -20
                 if confirmar "  → ¿Reinstalar esos paquetes?"; then
-                    local lista
-                    lista=$(awk -F': ' '{print $1}' "$tmp" | sort -u | tr '\n' ' ')
-                    [[ -n "$lista" ]] && {
-                        spinner "Reinstalando paquetes dañados" bash -c "sudo pacman -S --noconfirm $lista" || true
-                    }
+                    local -a lista=()
+                    mapfile -t lista < <(awk -F': ' '{print $1}' "$tmp" | sort -u)
+                    if (( ${#lista[@]} > 0 )); then
+                        spinner "Reinstalando paquetes dañados" sudo pacman -S --noconfirm "${lista[@]}" || true
+                    fi
                 fi
             else
-                echo -e "   ${GREEN}✔ Ningún paquete con archivos faltantes.${RESET}"
+                echo -e "   ${GREEN}[ OK ] Ningún paquete con archivos faltantes.${RESET}"
             fi
             rm -f "$tmp"
             ;;
@@ -4054,7 +4145,7 @@ reparar_paquetes() {
             if confirmar "  → ¿Reconfigurar paquetes incompletos (dpkg --configure -a)?"; then
                 sudo dpkg --configure -a 2>/dev/null
                 spinner "Corrigiendo dependencias (apt -f install)" sudo apt-get -y -f install 2>/dev/null
-                echo -e "   ${GREEN}✔ Reparación completada.${RESET}"
+                echo -e "   ${GREEN}[ OK ] Reparación completada.${RESET}"
             fi
             ;;
         *)
@@ -4087,7 +4178,7 @@ diagnostico_estabilidad() {
         done < <(lsblk -dno NAME 2>/dev/null | grep -E '^(sd[a-z]|nvme[0-9]n[0-9]+|mmcblk[0-9]+)$')
         [[ -z "$smartl" ]] && echo -e "   ${DIM}   smartmontools presente pero sin discos compatibles.${RESET}"
     else
-        echo -e "   ${YELLOW}⚠ smartmontools no instalado (sudo pacman -S smartmontools).${RESET}"
+        echo -e "   ${YELLOW}[ WARN ] smartmontools no instalado (sudo pacman -S smartmontools).${RESET}"
     fi
 
     echo -e "${BOLD}▸ Errores de E/S y kernel (14 días):${RESET}"
@@ -4141,7 +4232,7 @@ diagnostico_estabilidad() {
 
     echo ""
     echo -e "${YELLOW}════════════════════════════════════════════════════════════${RESET}"
-    echo -e "${GREEN}✔  Diagnóstico finalizado${RESET}"
+    echo -e "${GREEN}[ OK ]  Diagnóstico finalizado${RESET}"
     echo -e "${YELLOW}════════════════════════════════════════════════════════════${RESET}"
     registrar_ultima_accion "Diagnóstico integral de estabilidad"
     pause
@@ -4181,21 +4272,21 @@ modulo_filesystem() {
         echo -e "${BOLD}▸ TRIM (SSD):${RESET}"
         if command -v fstrim >/dev/null 2>&1; then
             if systemctl is-enabled fstrim.timer >/dev/null 2>&1; then
-                echo -e "   ${GREEN}✔ fstrim.timer activo (TRIM semanal automático)${RESET}"
+                echo -e "   ${GREEN}[ OK ] fstrim.timer activo (TRIM semanal automático)${RESET}"
             else
-                echo -e "   ${YELLOW}⚠ fstrim.timer desactivado.${RESET}"
+                echo -e "   ${YELLOW}[ WARN ] fstrim.timer desactivado.${RESET}"
                 if confirmar "  → ¿Activar el TRIM automático semanal (fstrim.timer)?"; then
                     if check_sudo && sudo systemctl enable --now fstrim.timer 2>/dev/null; then
-                        echo -e "   ${GREEN}✔ TRIM automático activado${RESET}"
+                        echo -e "   ${GREEN}[ OK ] TRIM automático activado${RESET}"
                     else
-                        echo -e "   ${YELLOW}⚠ No se pudo activar.${RESET}"
+                        echo -e "   ${YELLOW}[ WARN ] No se pudo activar.${RESET}"
                     fi
                 fi
             fi
             if confirmar "  → ¿Ejecutar TRIM manual ahora (fstrim -av)?"; then
                 if check_sudo; then
                     spinner "Ejecutando TRIM" sudo fstrim -av
-                    echo -e "   ${GREEN}✔ TRIM completado${RESET}"
+                    echo -e "   ${GREEN}[ OK ] TRIM completado${RESET}"
                 fi
             fi
         else
@@ -4215,7 +4306,7 @@ modulo_filesystem() {
         fi
         if confirmar "  → ¿Iniciar un 'scrub' ahora? (verifica integridad; leerá todo el disco)"; then
             spinner "Scrub de btrfs (iniciado)" sudo btrfs scrub start /
-            echo -e "   ${GREEN}✔ Scrub iniciado; sigue su estado con 'btrfs scrub status /'${RESET}"
+            echo -e "   ${GREEN}[ OK ] Scrub iniciado; sigue su estado con 'btrfs scrub status /'${RESET}"
         fi
         if confirmar "  → ¿Comprobar si hay un 'balance' en curso?"; then
             sudo btrfs balance status / 2>/dev/null
@@ -4231,7 +4322,7 @@ modulo_filesystem() {
         sudo tune2fs -l "$dev_fs" 2>/dev/null | grep -E 'Filesystem state|Last checked|Mount count|Maximum mount' | sed 's/^/   /' || true
         if confirmar "  → ¿Programar verificación (fsck) en el próximo arranque?"; then
             if check_sudo && sudo touch /forcefsck 2>/dev/null; then
-                echo -e "   ${GREEN}✔ fsck programado para el próximo arranque${RESET}"
+                echo -e "   ${GREEN}[ OK ] fsck programado para el próximo arranque${RESET}"
             fi
         fi
     fi
@@ -4310,7 +4401,7 @@ analisis_arranque() {
                 desc=$(systemctl show -p Description --value "$unidad" 2>/dev/null)
                 echo -e "   ${DIM}${lenta}${RESET}  ${desc}"
                 if confirmar "     → ¿Desactivar ${unidad}?"; then
-                    sudo systemctl disable --now "$unidad" 2>/dev/null && echo -e "     ${GREEN}✔ ${unidad} desactivado${RESET}" || echo -e "     ${YELLOW}⚠ No se pudo desactivar.${RESET}"
+                    sudo systemctl disable --now "$unidad" 2>/dev/null && echo -e "     ${GREEN}[ OK ] ${unidad} desactivado${RESET}" || echo -e "     ${YELLOW}[ WARN ] No se pudo desactivar.${RESET}"
                 fi
                 ;;
         esac
@@ -4338,9 +4429,9 @@ seguridad_sistema() {
         listening=$(ss -tulpn 2>/dev/null | grep LISTEN | grep -vE '127\.0\.0\.[0-9]+|::1')
         if [[ -n "$listening" ]]; then
             ss -tulpn 2>/dev/null | grep LISTEN | head -20 | sed 's/^/   /'
-            echo -e "   ${YELLOW}⚠ Servicios accesibles desde la red. Revísalos.${RESET}"
+            echo -e "   ${YELLOW}[ WARN ] Servicios accesibles desde la red. Revísalos.${RESET}"
         else
-            echo -e "   ${GREEN}✔ No hay servicios escuchando en interfaces públicas.${RESET}"
+            echo -e "   ${GREEN}[ OK ] No hay servicios escuchando en interfaces públicas.${RESET}"
         fi
     else
         echo -e "   ${YELLOW}iproute2 (ss) no instalado.${RESET}"
@@ -4368,7 +4459,7 @@ seguridad_sistema() {
             sudo mkdir -p /etc/systemd/coredump.conf.d 2>/dev/null
             echo -e "Storage=journal" | sudo tee /etc/systemd/coredump.conf.d/kyro.conf >/dev/null 2>&1
             sudo systemctl daemon-reload 2>/dev/null
-            echo -e "   ${GREEN}✔ Coredumps limitados al journal${RESET}"
+            echo -e "   ${GREEN}[ OK ] Coredumps limitados al journal${RESET}"
         fi
     fi
 
@@ -4402,7 +4493,7 @@ seguridad_sistema() {
 
     echo ""
     echo -e "${YELLOW}════════════════════════════════════════════════════════════${RESET}"
-    echo -e "${GREEN}✔  Módulo de seguridad finalizado${RESET}"
+    echo -e "${GREEN}[ OK ]  Módulo de seguridad finalizado${RESET}"
     echo -e "${YELLOW}════════════════════════════════════════════════════════════${RESET}"
     registrar_ultima_accion "Seguridad del sistema"
     pause
@@ -4429,30 +4520,30 @@ mantenimiento_paquetes() {
         pacman)
             echo -e "${BOLD}▸ Base de datos de pacman:${RESET}"
             if sudo pacman -Dk 2>/dev/null | grep -iqE 'error|unresolvable'; then
-                echo -e "   ${YELLOW}⚠ Inconsistencias detectadas.${RESET}"
+                echo -e "   ${YELLOW}[ WARN ] Inconsistencias detectadas.${RESET}"
                 if confirmar "  → ¿Refrescar y reconstruir la base (pacman -Syy + -Dk)?"; then
-                    sudo pacman -Syy >/dev/null 2>&1 && echo -e "   ${GREEN}✔ Base de datos refrescada.${RESET}"
+                    sudo pacman -Syy >/dev/null 2>&1 && echo -e "   ${GREEN}[ OK ] Base de datos refrescada.${RESET}"
                 fi
             else
-                echo -e "   ${GREEN}✔ Base de datos íntegra.${RESET}"
+                echo -e "   ${GREEN}[ OK ] Base de datos íntegra.${RESET}"
             fi
             echo -e "${BOLD}▸ Claves GPG (pacman-key):${RESET}"
             if confirmar "  → ¿Refrescar las claves de firma (pacman-key --refresh-keys)? (requiere red y un rato)"; then
                 spinner "Refrescando claves GPG" sudo pacman-key --refresh-keys 2>/dev/null
-                echo -e "   ${GREEN}✔ Claves refrescadas${RESET}"
+                echo -e "   ${GREEN}[ OK ] Claves refrescadas${RESET}"
             fi
             ;;
         apt)
             echo -e "${BOLD}▸ dpkg:${RESET}"
             if sudo dpkg --audit 2>/dev/null | grep -q .; then
-                echo -e "   ${YELLOW}⚠ Paquetes inconsistentes.${RESET}"
+                echo -e "   ${YELLOW}[ WARN ] Paquetes inconsistentes.${RESET}"
                 if confirmar "  → ¿Reparar (dpkg --configure -a + apt -f install)?"; then
                     sudo dpkg --configure -a 2>/dev/null
                     sudo apt-get -y -f install 2>/dev/null
-                    echo -e "   ${GREEN}✔ dpkg reparado${RESET}"
+                    echo -e "   ${GREEN}[ OK ] dpkg reparado${RESET}"
                 fi
             else
-                echo -e "   ${GREEN}✔ dpkg sin inconsistencias.${RESET}"
+                echo -e "   ${GREEN}[ OK ] dpkg sin inconsistencias.${RESET}"
             fi
             ;;
         dnf)
@@ -4462,7 +4553,7 @@ mantenimiento_paquetes() {
             echo -e "   ${DIM}${dnf_extras} paquete(s) 'extras' (sin dueño)${RESET}"
             if (( dnf_extras > 0 )) && confirmar "  → ¿Eliminar los extras (dnf autoremove)?"; then
                 sudo dnf autoremove -y 2>/dev/null
-                echo -e "   ${GREEN}✔ Extras eliminados${RESET}"
+                echo -e "   ${GREEN}[ OK ] Extras eliminados${RESET}"
             fi
             ;;
         *)  echo -e "${YELLOW}Gestor no soportado para este módulo.${RESET}" ;;
@@ -4472,11 +4563,11 @@ mantenimiento_paquetes() {
     if command -v flatpak >/dev/null 2>&1; then
         if confirmar "  → ¿Reparar el almacén de Flatpak (flatpak repair --user)?"; then
             spinner "Reparando Flatpak" flatpak repair --user
-            echo -e "   ${GREEN}✔ Reparación de Flatpak completada${RESET}"
+            echo -e "   ${GREEN}[ OK ] Reparación de Flatpak completada${RESET}"
         fi
         if confirmar "  → ¿Eliminar runtimes/paquetes Flatpak sin uso?"; then
             flatpak uninstall --unused --assumeyes 2>/dev/null
-            echo -e "   ${GREEN}✔ Flatpak sin uso eliminados${RESET}"
+            echo -e "   ${GREEN}[ OK ] Flatpak sin uso eliminados${RESET}"
         fi
     else
         echo -e "   ${DIM}Flatpak no instalado.${RESET}"
@@ -4491,7 +4582,7 @@ mantenimiento_paquetes() {
                 while read -r sname srev; do
                     [[ -n "$sname" && -n "$srev" ]] && sudo snap remove "$sname" --revision="$srev" 2>/dev/null
                 done < <(sudo snap list --all 2>/dev/null | awk '/disabled/{print $1, $3}')
-                echo -e "   ${GREEN}✔ Snap purgado${RESET}"
+                echo -e "   ${GREEN}[ OK ] Snap purgado${RESET}"
             fi
         else
             echo -e "   ${DIM}Snap sin revisiones deshabilitadas.${RESET}"
@@ -4502,7 +4593,7 @@ mantenimiento_paquetes() {
 
     echo ""
     echo -e "${YELLOW}════════════════════════════════════════════════════════════${RESET}"
-    echo -e "${GREEN}✔  Mantenimiento de paquetes finalizado${RESET}"
+    echo -e "${GREEN}[ OK ]  Mantenimiento de paquetes finalizado${RESET}"
     echo -e "${YELLOW}════════════════════════════════════════════════════════════${RESET}"
     registrar_ultima_accion "Mantenimiento avanzado de paquetes"
     pause
@@ -4513,6 +4604,7 @@ mantenimiento_paquetes() {
 # ═══════════════════════════════════════════════════════
 menu() {
     comprobar_update_fondo &
+    KYRO_BG_PIDS+=("$!")
     while true; do
         header
 
@@ -4612,9 +4704,12 @@ Uso:
   ./Kyro.sh --status         Informe rápido del sistema (solo lectura)
   ./Kyro.sh --health         Chequeo de salud breve (solo lectura)
   ./Kyro.sh --update-check   Comprueba si hay una actualización de Kyro
+  ./Kyro.sh --yes             Abre el menú con confirmaciones automáticas
   ./Kyro.sh --help           Esta ayuda
 
-Todos los modos --* son de solo lectura: no modifican nada.
+Nota: --yes activa confirmaciones automáticas y debe usarse solo cuando
+se entiendan las acciones destructivas. Los modos de consulta (--status,
+--health y --update-check) son de solo lectura.
 EOF
 }
 
@@ -4658,11 +4753,12 @@ chequeo_salud_cli() {
 
 main() {
     case "${1:-}" in
+        --yes|-y) AUTO_SI=1; menu ;;
         -h|--help|help)      mostrar_ayuda ;;
         -v|--version|version) echo "Kyro Optimizer v$VERSION"; exit 0 ;;
         --status|status)     estado_cli ;;
         --health|health)     chequeo_salud_cli ;;
-        --update-check|--check-update) comprobar_update; exit $? ;;
+        --update-check|--check-update) comprobar_update; return $? ;;
         "")                  menu ;;
         *) echo -e "${RED}Opción CLI desconocida: $1${RESET}"; mostrar_ayuda; exit 1 ;;
     esac
