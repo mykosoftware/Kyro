@@ -3,7 +3,7 @@
 # ═══════════════════════════════════════════════════════
 #  Kyro Optimizer – Mantenimiento y diagnóstico del sistema
 #  Licencia: GPL-3.0
-#  Versión: 5.1.Lexia
+#  Versión: 5.2.Lexia
 #  By: Myko Software
 # ═══════════════════════════════════════════════════════
 
@@ -11,7 +11,7 @@ set -uo pipefail
 
 umask 077
 
-VERSION="5.1.Lexia"
+VERSION="5.2.Lexia"
 
 # ─── Colores ───────────────────────────────────────────
 CYAN="\e[36m"
@@ -4499,6 +4499,69 @@ seguridad_sistema() {
     pause
 }
 
+# ─── 34) Acceso a dispositivos HID (hidraw) ─────────────
+# Permite leer/escribir /dev/hidraw* sin permisos de superusuario continuos
+# (mandos, periféricos y herramientas de configuración). Aplica una regla de
+# udev 0666 de forma no interactiva y recarga las reglas al momento.
+acceso_hidraw() {
+    clear
+    echo -e "${CYAN}${BOLD}╭─ Acceso a dispositivos HID (hidraw) ─────────────────────────╮${RESET}"
+    echo -e "${CYAN}│${RESET} Regla udev para leer/escribir hidraw sin sudo.${CYAN}"
+    echo -e "${CYAN}╰──────────────────────────────────────────────────────────────────╯${RESET}"
+    echo ""
+
+    if ! check_sudo; then
+        pause
+        return
+    fi
+
+    local RULES_FILE="/etc/udev/rules.d/99-hidraw.rules"
+    local RULE='SUBSYSTEM=="hidraw", MODE="0666"'
+    local rc=0
+
+    # ── 1) Crear/modificar la regla (idempotente) ──
+    if [[ -f "$RULES_FILE" ]] && grep -qF "$RULE" "$RULES_FILE"; then
+        echo -e "   ${YELLOW}[ INFO ] La regla hidraw ya estaba presente en $RULES_FILE.${RESET}"
+    else
+        if sudo mkdir -p "$(dirname "$RULES_FILE")" 2>/dev/null && \
+           sudo sh -c "echo \"$RULE\" >> \"$RULES_FILE\""; then
+            echo -e "   ${GREEN}[ OK ] Regla creada: $RULES_FILE${RESET}"
+            echo -e "   ${DIM}         $RULE${RESET}"
+        else
+            echo -e "   ${RED}[ ERROR ] No se pudo escribir $RULES_FILE.${RESET}"
+            pause
+            return 1
+        fi
+    fi
+
+    # ── 2) Recargar reglas de udev y aplicar ──
+    echo ""
+    echo -e "   ${BOLD}Aplicando reglas de udev...${RESET}"
+    if spinner "Recargando reglas de udev" sudo udevadm control --reload-rules; then
+        if spinner "Reaplicando reglas de udev" sudo udevadm trigger; then
+            echo ""
+            echo -e "   ${GREEN}[ OK ] Reglas de udev recargadas y aplicadas.${RESET}"
+            echo -e "   ${DIM}   Los dispositivos hidraw ya son de acceso lectura/escritura.${RESET}"
+            rc=0
+        else
+            rc=1
+        fi
+    else
+        rc=1
+    fi
+
+    echo ""
+    if (( rc == 0 )); then
+        echo -e "${YELLOW}════════════════════════════════════════════════════════════${RESET}"
+        echo -e "${GREEN}[ OK ]  Acceso a dispositivos HID (hidraw) habilitado${RESET}"
+        echo -e "${YELLOW}════════════════════════════════════════════════════════════${RESET}"
+        registrar_ultima_accion "Acceso HID (hidraw) habilitado"
+    else
+        echo -e "${RED}[ ERROR ] Algo falló al aplicar las reglas de udev.${RESET}"
+    fi
+    pause
+}
+
 # ─── 25) Mantenimiento avanzado de paquetes ─────────────
 # Integridad de bases de datos, Flatpak/Snap y claves GPG. Todo confirmado.
 mantenimiento_paquetes() {
@@ -4643,6 +4706,7 @@ ${CYAN}${BOLD} ──── KYRO ───────────────�
         echo -e "${CYAN}28)${RESET} Chequeo de salud completo                          ${CYAN}29)${RESET} Limpieza profunda"
         echo -e "${CYAN}30)${RESET} Restaurar ajustes de Kyro (rollback)               ${CYAN}31)${RESET} Estabilizador"
         echo -e "${CYAN}32)${RESET} Reparador de paquetes                             ${CYAN}33)${RESET} Diag. estabilidad"
+        echo -e "${CYAN}34)${RESET} Acceso a dispositivos HID (hidraw)"
 
         echo -e "${CYAN} ───────────────────────────────────────────────────────────${RESET}"
         echo -e "${CYAN} S)${RESET} Resumen del sistema                    ${RED}0)${RESET} Salir"
@@ -4684,6 +4748,7 @@ ${CYAN}${BOLD} ──── KYRO ───────────────�
             31) estabilizador ;;
             32) reparar_paquetes ;;
             33) diagnostico_estabilidad ;;
+            34) acceso_hidraw ;;
             [Ss]) system_box ;;
             0|q|Q) exit 0 ;;
             *) echo -e "${RED}Opción inválida${RESET}"; sleep 1 ;;
